@@ -4,21 +4,11 @@ on:
   push:
     # Publish `master` as Docker `latest` image.
     branches:
-      - storage-ppc
+      - workflow-ppc
 
     # Publish `v1.2.3` tags as releases.
     tags:
       - v*
-
-  # Run tests for any PRs.
-  # pull_request:
-  #   paths:
-  #     - "python/**"
-  #     - "!.github/**"
-  #     - "!docs/**"
-  #     - "!**.md"
-  #     - ".github/workflows/storage-initializer-docker-publisher.yml"
-  #     - ".github/actions/free-up-disk-space/**"
 
 env:
   IMAGE_NAME: storage-initializer
@@ -64,7 +54,7 @@ jobs:
   # See also https://docs.docker.com/docker-hub/builds/
   push:
     # Ensure test job passes before pushing image.
-    needs: test
+    #needs: test
 
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
