@@ -4,21 +4,21 @@ on:
   push:
     # Publish `master` as Docker `latest` image.
     branches:
-      - master
+      - storage-ppc
 
     # Publish `v1.2.3` tags as releases.
     tags:
       - v*
 
   # Run tests for any PRs.
-  pull_request:
-    paths:
-      - "python/**"
-      - "!.github/**"
-      - "!docs/**"
-      - "!**.md"
-      - ".github/workflows/storage-initializer-docker-publisher.yml"
-      - ".github/actions/free-up-disk-space/**"
+  # pull_request:
+  #   paths:
+  #     - "python/**"
+  #     - "!.github/**"
+  #     - "!docs/**"
+  #     - "!**.md"
+  #     - ".github/workflows/storage-initializer-docker-publisher.yml"
+  #     - ".github/actions/free-up-disk-space/**"
 
 env:
   IMAGE_NAME: storage-initializer
@@ -53,9 +53,9 @@ jobs:
       - name: Run tests
         uses: docker/build-push-action@v5
         with:
-          platforms: linux/amd64,linux/arm64/v8
+          platforms: linux/ppc64le
           context: python
-          file: python/storage-initializer.Dockerfile
+          file: python/storage-initializer-ppc64le.Dockerfile
           push: false
           # https://github.com/docker/buildx/issues/1533
           provenance: false
@@ -94,10 +94,10 @@ jobs:
 
       - name: Export version variable
         run: |
-          IMAGE_ID=kserve/$IMAGE_NAME
+          IMAGE_ID=${{ secrets.DOCKER_USER }}/$IMAGE_NAME
 
           # Change all uppercase to lowercase
-          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
+          #IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
 
           # Strip git ref prefix from version
           VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
@@ -114,9 +114,9 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          platforms: linux/amd64,linux/arm64/v8
+          platforms: linux/ppc64le
           context: python
-          file: python/storage-initializer.Dockerfile
+          file: python/storage-initializer-ppc64le.Dockerfile
           push: true
           tags: ${{ env.IMAGE_ID }}:${{ env.VERSION }}
           # https://github.com/docker/buildx/issues/1533
