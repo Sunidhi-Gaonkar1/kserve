@@ -1,4 +1,4 @@
-name: Storage Intializer Docker Publisher
+name: Storage Intializer PPC64LE Docker Publisher
 
 on:
   push:
