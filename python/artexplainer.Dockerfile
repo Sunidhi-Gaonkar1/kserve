@@ -44,10 +44,17 @@ RUN cd kserve && uv sync --active --no-reinstall --frozen
 
 # ------------------ artexplainer deps ------------------
 COPY artexplainer/pyproject.toml artexplainer/uv.lock artexplainer/
-RUN cd artexplainer && uv sync --active --no-cache
+RUN uv venv $VIRTUAL_ENV && \
+    $VIRTUAL_ENV/bin/python -m ensurepip && \
+    $VIRTUAL_ENV/bin/python -m pip install --upgrade pip setuptools wheel
+RUN $VIRTUAL_ENV/bin/python -m pip install --prefer-binary \
+      ml-dtypes==0.5.1 scikit-learn==1.6.1 pillow==10.4.0 scipy==1.15.2 \
+      --extra-index-url=https://wheels.developerfirst.ibm.com/ppc64le/linux
+
+RUN cd artexplainer && uv sync --active --no-reinstall --frozen
 
 COPY artexplainer artexplainer
-RUN cd artexplainer && uv sync --active --no-cache
+RUN cd artexplainer && uv sync --active --no-reinstall --frozen
 
 # Generate third-party licenses
 COPY pyproject.toml pyproject.toml
