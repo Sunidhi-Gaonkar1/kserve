@@ -23,10 +23,24 @@ COPY storage storage
 
 # ------------------ kserve deps ------------------
 COPY kserve/pyproject.toml kserve/uv.lock kserve/
-RUN cd kserve && uv sync --active --no-cache
+RUN echo "===== kserve/uv.lock content =====" && \
+    cat kserve/uv.lock || echo "No uv.lock found" && \
+    echo "==================================="
+
+# Preinstall core dependencies using prebuilt IBM wheels
+RUN which pip && python -m site
+RUN $VIRTUAL_ENV/bin/python -m pip install --prefer-binary \
+      pandas==2.2.3 grpcio==1.71.0 pyyaml==6.0.2 httptools==0.6.4 \
+      psutil==5.9.8 \
+      --extra-index-url=https://wheels.developerfirst.ibm.com/ppc64le/linux
+
+# Configure uv to reuse binaries and same index
+ENV UV_EXTRA_INDEX_URL="https://pypi.org/simple https://wheels.developerfirst.ibm.com/ppc64le/linux"
+ENV UV_INDEX_STRATEGY=unsafe-best-match
+RUN cd kserve && uv sync --active --no-reinstall --frozen
 
 COPY kserve kserve
-RUN cd kserve && uv sync --active --no-cache
+RUN cd kserve && uv sync --active --no-reinstall --frozen
 
 # ------------------ artexplainer deps ------------------
 COPY artexplainer/pyproject.toml artexplainer/uv.lock artexplainer/
