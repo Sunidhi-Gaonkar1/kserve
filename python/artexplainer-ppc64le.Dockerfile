@@ -5,7 +5,7 @@ ARG VENV_PATH=/prod_venv
 FROM ${BASE_IMAGE} AS builder
 
 # Required for building packages for arm64 arch
-RUN apt-get update && apt-get install -y --no-install-recommends curl python3-dev build-essential gcc gfortran cmake pkg-config libssl-dev libopenblas-dev libjpeg-dev libhdf5-dev && apt-get clean && \
+RUN apt-get update && apt-get install -y --no-install-recommends curl python3-dev build-essential gcc gfortran cmake pkg-config libssl-dev libopenblas-dev libjpeg-dev libhdf5-dev wget && apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -29,6 +29,14 @@ COPY kserve/pyproject.toml kserve/uv.lock kserve/
 RUN echo "===== kserve/uv.lock content =====" && \
     cat kserve/uv.lock || echo "No uv.lock found" && \
     echo "==================================="
+
+# ----- use conda ----------
+RUN wget https://repo.continuum.io/miniconda/Miniconda3-latest-Linux-ppc64le.sh && \
+    sh Miniconda3-latest-Linux-ppc64le.sh -u -b -p $HOME/conda && \
+    $HOME/conda/bin/conda update -y -n base conda && \
+    export PATH=$HOME/conda/bin/:$PATH && \
+    conda --version
+RUN  export PATH=$HOME/conda/bin/:$PATH && conda install conda-forge::h5py==3.10
 
 # Preinstall core dependencies using prebuilt IBM wheels
 RUN which pip && python -m site
