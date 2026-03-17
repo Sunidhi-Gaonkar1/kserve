@@ -31,18 +31,12 @@ RUN echo "===== kserve/uv.lock content =====" && \
     echo "==================================="
 
 # ----- use conda ----------
-RUN wget https://repo.continuum.io/miniconda/Miniconda3-latest-Linux-ppc64le.sh && \
-    sh Miniconda3-latest-Linux-ppc64le.sh -u -b -p $HOME/conda && \
-    $HOME/conda/bin/conda update -y -n base conda && \
-    export PATH=$HOME/conda/bin/:$PATH && \
-    conda --version
-RUN  export PATH=$HOME/conda/bin/:$PATH && conda install conda-forge::h5py==3.10
 
 # Preinstall core dependencies using prebuilt IBM wheels
 RUN which pip && python -m site
 RUN $VIRTUAL_ENV/bin/python -m pip install --prefer-binary \
       pandas==2.2.3 grpcio==1.71.0 pyyaml==6.0.2 httptools==0.6.4 \
-      psutil==5.9.8 \
+      psutil==5.9.8  numpy==2.3.1 \
       --extra-index-url=https://wheels.developerfirst.ibm.com/ppc64le/linux
 
 # Configure uv to reuse binaries and same index
