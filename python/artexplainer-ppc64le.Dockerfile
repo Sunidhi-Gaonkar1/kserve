@@ -49,7 +49,7 @@ RUN cd kserve && uv sync --active --no-reinstall --frozen
 
 # ------------------ artexplainer deps ------------------
 COPY artexplainer/pyproject.toml artexplainer/uv.lock artexplainer/
-RUN uv venv $VIRTUAL_ENV && \
+RUN uv venv $VIRTUAL_ENV --clear && \
     $VIRTUAL_ENV/bin/python -m ensurepip && \
     $VIRTUAL_ENV/bin/python -m pip install --upgrade pip setuptools wheel
 RUN $VIRTUAL_ENV/bin/python -m pip install --prefer-binary \
