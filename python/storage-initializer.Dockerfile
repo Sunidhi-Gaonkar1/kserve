@@ -6,7 +6,7 @@ FROM ${BASE_IMAGE} AS builder
 
 # Install all system dependencies first
 RUN apt-get update && apt-get install -y --no-install-recommends python3-dev curl build-essential && apt-get clean && \
-    if [ "$(uname -m)" = "ppc64le" ]; then apt-get install pkg-config libssl-dev -y; fi && \
+    if [ "$(uname -m)" = "x86_64" ]; then apt-get install pkg-config libssl-dev -y; fi && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
