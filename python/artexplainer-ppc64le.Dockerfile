@@ -21,6 +21,9 @@ RUN uv venv $VIRTUAL_ENV && \
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 ENV GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1
 
+RUN wget https://raw.githubusercontent.com/Sunidhi-Gaonkar1/build-scripts/refs/heads/test-grpcio/g/grpcio_tools/grpcio_tools_ubi_9.6.sh && bash grpcio_tools_ubi_9.6.sh
+RUN cp /grpc/tools/distrib/python/grpcio_tools/dist/.whl .
+
 # Copy storage directory for editable install
 COPY storage storage
 
