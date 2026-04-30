@@ -4,21 +4,21 @@ on:
   push:
     # Publish `master` as Docker `latest` image.
     branches:
-      - master
+      - test-art-final-changes
 
     # Publish `v1.2.3` tags as releases.
     tags:
       - v*
 
   # Run tests for any PRs.
-  pull_request:
-    paths:
-      - "python/**"
-      - "!.github/**"
-      - "!docs/**"
-      - "!**.md"
-      - ".github/workflows/artexplainer-docker-publish.yml"
-      - ".github/actions/free-up-disk-space/**"
+  # pull_request:
+  #   paths:
+  #     - "python/**"
+  #     - "!.github/**"
+  #     - "!docs/**"
+  #     - "!**.md"
+  #     - ".github/workflows/artexplainer-docker-publish.yml"
+  #     - ".github/actions/free-up-disk-space/**"
   # To save some compute time, rely on PR check and don't run for merge queues
   # merge_group:
   #   types: [ checks_requested ]

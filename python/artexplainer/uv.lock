@@ -1308,7 +1308,7 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/20/e8/45a05d9c39d2cea61ab175dbe6a2de1d05b679e8de2011da4ee190d7e748/pandas-2.2.3-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:6dfcb5ee8d4d50c06a51c2fffa6cff6272098ad6540aed1a76d15fb9318194d8", size = 16359235, upload-time = "2024-09-20T19:02:07.094Z" },
     { url = "https://files.pythonhosted.org/packages/1d/99/617d07a6a5e429ff90c90da64d428516605a1ec7d7bea494235e1c3882de/pandas-2.2.3-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:062309c1b9ea12a50e8ce661145c6aab431b1e99530d3cd60640e255778bd43a", size = 14056756, upload-time = "2024-09-20T13:09:20.474Z" },
     { url = "https://files.pythonhosted.org/packages/29/d4/1244ab8edf173a10fd601f7e13b9566c1b525c4f365d6bee918e68381889/pandas-2.2.3-cp312-cp312-win_amd64.whl", hash = "sha256:59ef3764d0fe818125a5097d2ae867ca3fa64df032331b7e0917cf5d7bf66b13", size = 11504248, upload-time = "2024-09-20T13:09:23.137Z" },
-    { url = "https://wheels.developerfirst.ibm.com/ppc64le/linux/+f/b50/dffcbf63f76be/pandas-2.2.3-cp311-cp311-linux_ppc64le.whl", hash = https://wheels.developerfirst.ibm.com/ppc64le/linux/+f/b50/dffcbf63f76be/pandas-2.2.3-cp311-cp311-linux_ppc64le.whl" , hash = "sha256:b50dffcbf63f76be6647f095e3009c6236bd21b1b5ee1a5cc50d1eae7e2d7087" , },
+    { url = "https://wheels.developerfirst.ibm.com/ppc64le/linux/+f/b50/dffcbf63f76be/pandas-2.2.3-cp311-cp311-linux_ppc64le.whl" , hash = "sha256:b50dffcbf63f76be6647f095e3009c6236bd21b1b5ee1a5cc50d1eae7e2d7087" },
 ]
 
 [[package]]
