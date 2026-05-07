@@ -1396,6 +1396,7 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c9/e5/311efa9278a451291e317286babf3f69b1479f8e6fd244836e3803e4b81d/grpcio_tools-1.78.1.tar.gz", hash = "sha256:f47b746b06a940954b9aa86b1824aa4874f068a7ec2d4b407980d202c86a691a", size = 5392610, upload-time = "2026-02-20T01:19:44.109Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/41/76/cc00f693a085e6ddc2477d6dc59ad3e0b0a2f8797ff3703b45e25ddca387/grpcio_tools-1.78.1-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:b0abde2cd28a5925da36776977064e0fe9be667a96ea454acad1eabc3eb7ec48", size = 2545568, upload-time = "2026-02-20T01:16:27.181Z" },
+    { url = "https://wheels-staging.developerfirst.ibm.com/ppc64le/linux/+f/834/425404ee194a1/grpcio_tools-1.78.1+ppc64le1-cp311-cp311-manylinux_2_34_ppc64le.whl" , hash = "sha256:834425404ee194a17c4c79b0868eebf9abd6429b2314b42998a50c68052b63ad"},
 ]
 
 [[package]]
