@@ -21,28 +21,22 @@ RUN uv venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 
-
-
 # Copy storage metadata for editable dependency resolution
 COPY storage/pyproject.toml storage/uv.lock storage/
 
 # ------------------ kserve deps ------------------
 COPY kserve/pyproject.toml kserve/uv.lock kserve/
-RUN if [ "$(uname -m)" = "ppc64le" ]; then export GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1; fi && \
-    cd kserve && uv sync --active --no-cache
+RUN cd kserve && uv sync --active --no-cache
 
 COPY kserve kserve
-RUN if [ "$(uname -m)" = "ppc64le" ]; then export GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1; fi && \
-    cd kserve && uv sync --active --no-cache
+RUN cd kserve && uv sync --active --no-cache
 
 # ------------------ artexplainer deps ------------------
 COPY artexplainer/pyproject.toml artexplainer/uv.lock artexplainer/
-RUN if [ "$(uname -m)" = "ppc64le" ]; then export GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1; fi && \
-    cd artexplainer && uv sync --active --no-cache
+RUN cd artexplainer && uv sync --active --no-cache
 
 COPY artexplainer artexplainer
-RUN if [ "$(uname -m)" = "ppc64le" ]; then export GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1; fi && \
-    cd artexplainer && uv sync --active --no-cache
+RUN  cd artexplainer && uv sync --active --no-cache
 
 # Generate third-party licenses
 COPY pyproject.toml pyproject.toml
