@@ -104,6 +104,9 @@ dev = [
 index-url = "https://test.pypi.org/simple/"
 extra-index-url = ["https://pypi.org/simple"]
 index-strategy = "unsafe-best-match"
+find-links = [
+  "https://wheels.developerfirst.ibm.com/ppc64le/linux"
+]
 
 [build-system]
 requires = ["setuptools>=61.0"]
