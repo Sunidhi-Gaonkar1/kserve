@@ -5,7 +5,9 @@ ARG VENV_PATH=/prod_venv
 FROM ${BASE_IMAGE} AS builder
 
 # Required for building packages for arm64 arch
-RUN apt-get update && apt-get install -y --no-install-recommends curl python3-dev build-essential gcc gfortran cmake pkg-config libssl-dev libopenblas-dev libjpeg-dev libhdf5-dev wget && apt-get clean && \
+RUN apt-get update && apt-get install -y --no-install-recommends curl python3-dev build-essential && \
+    if [ "$(uname -m)" = "ppc64le" ]; then apt-get install pkg-config libssl-dev gcc gfortran cmake pkg-config libssl-dev libopenblas-dev libjpeg-dev libhdf5-dev wget -y; fi && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -15,54 +17,27 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
 # Setup virtual environment
 ARG VENV_PATH
 ENV VIRTUAL_ENV=${VENV_PATH}
-RUN uv venv $VIRTUAL_ENV && \
-    $VIRTUAL_ENV/bin/python -m ensurepip && \
-    $VIRTUAL_ENV/bin/python -m pip install --upgrade pip setuptools wheel
+RUN uv venv $VIRTUAL_ENV
+ENV UV_SKIP_WHEEL_FILENAME_CHECK=1
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-ENV GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1
 
-RUN wget https://raw.githubusercontent.com/Sunidhi-Gaonkar1/build-scripts/refs/heads/test-grpcio/g/grpcio_tools/grpcio_tools_ubi_9.6.sh && bash grpcio_tools_ubi_9.6.sh
-RUN cp /grpc/tools/distrib/python/grpcio_tools/dist/.whl .
-
-# Copy storage directory for editable install
-COPY storage storage
+# Copy storage metadata for editable dependency resolution
+COPY storage/pyproject.toml storage/uv.lock storage/
 
 # ------------------ kserve deps ------------------
 COPY kserve/pyproject.toml kserve/uv.lock kserve/
-RUN echo "===== kserve/uv.lock content =====" && \
-    cat kserve/uv.lock || echo "No uv.lock found" && \
-    echo "==================================="
-
-# ----- use conda ----------
-
-# Preinstall core dependencies using prebuilt IBM wheels
-RUN which pip && python -m site
-RUN $VIRTUAL_ENV/bin/python -m pip install --prefer-binary \
-      pandas==2.2.3 grpcio==1.71.0 pyyaml==6.0.2 httptools==0.6.4 \
-      psutil==5.9.8  numpy==2.3.1 \
-      --extra-index-url=https://wheels.developerfirst.ibm.com/ppc64le/linux
-
-# Configure uv to reuse binaries and same index
-ENV UV_EXTRA_INDEX_URL="https://pypi.org/simple https://wheels.developerfirst.ibm.com/ppc64le/linux"
-ENV UV_INDEX_STRATEGY=unsafe-best-match
-RUN cd kserve && uv sync --active --no-reinstall --frozen
+RUN cd kserve && uv cache clean && uv lock --upgrade 
+RUN cd kserve && uv sync --active --no-cache
 
 COPY kserve kserve
-RUN cd kserve && uv sync --active --no-reinstall --frozen
+RUN cd kserve && uv cache clean && uv lock --upgrade && uv sync --active --no-cache
 
 # ------------------ artexplainer deps ------------------
 COPY artexplainer/pyproject.toml artexplainer/uv.lock artexplainer/
-RUN uv venv $VIRTUAL_ENV --clear && \
-    $VIRTUAL_ENV/bin/python -m ensurepip && \
-    $VIRTUAL_ENV/bin/python -m pip install --upgrade pip setuptools wheel
-RUN $VIRTUAL_ENV/bin/python -m pip install --prefer-binary \
-      ml-dtypes==0.5.1 scikit-learn==1.6.1 pillow==10.4.0 scipy==1.15.2 \
-      --extra-index-url=https://wheels.developerfirst.ibm.com/ppc64le/linux
-
-RUN cd artexplainer && uv sync --active --no-reinstall --frozen
+RUN cd artexplainer && uv cache clean && uv lock --upgrade && uv sync --active --no-cache
 
 COPY artexplainer artexplainer
-RUN cd artexplainer && uv sync --active --no-reinstall --frozen
+RUN cd artexplainer && uv cache clean && uv lock --upgrade && uv sync --active --no-cache
 
 # Generate third-party licenses
 COPY pyproject.toml pyproject.toml
@@ -79,8 +54,6 @@ FROM ${BASE_IMAGE} AS prod
 ARG VENV_PATH
 ENV VIRTUAL_ENV=${VENV_PATH}
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-
-COPY third_party third_party
 
 RUN useradd kserve -m -u 1000 -d /home/kserve
 
