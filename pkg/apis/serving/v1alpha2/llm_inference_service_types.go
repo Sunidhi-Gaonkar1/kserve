@@ -100,8 +100,6 @@ type LLMInferenceServiceSpec struct {
 
 // WorkloadSpec defines the configuration for a deployment workload, such as replicas and pod specifications.
 // +kubebuilder:validation:XValidation:rule="!(has(self.replicas) && has(self.scaling))",message="replicas and scaling are mutually exclusive; use scaling for autoscaled deployments or replicas for static deployments"
-// +kubebuilder:validation:XValidation:rule="!(has(self.worker) && has(self.scaling))",message="autoscaling (scaling) is not supported for multi-node deployments (worker is set); remove scaling and use replicas instead to set a fixed replica count"
-// TODO: remove the worker+scaling restriction above once WVA supports LeaderWorkerSet as a scaling target.
 type WorkloadSpec struct {
 	// Number of replicas for the deployment.
 	// +optional
@@ -167,13 +165,33 @@ type LLMModelSpec struct {
 
 // LoRASpec defines the configuration for LoRA adapters.
 type LoRASpec struct {
-	// Adapters is the static specification for one or more LoRA adapters.
-	// Each adapter is defined by its own ModelSpec.
+	// Adapters is a list of LoRA (Low-Rank Adaptation) adapters to attach to the base model.
+	// Each adapter is specified by name and URI (supports hf://, s3://, and pvc:// schemes).
+	// The controller automatically downloads adapters and configures the runtime to use them.
 	// +optional
 	// This type is recursive https://github.com/kubernetes-sigs/controller-tools/issues/585
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Schemaless
 	Adapters []LLMModelSpec `json:"adapters,omitempty"`
+
+	// MaxRank is the maximum LoRA rank supported by the runtime (maps to vLLM --max-lora-rank).
+	// Higher values allow adapters with higher rank but increase memory usage.
+	// If not set, vLLM's default applies (16).
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxRank *int32 `json:"maxRank,omitempty"`
+
+	// MaxAdapters is the maximum number of LoRA adapters that can be loaded simultaneously
+	// (maps to vLLM --max-loras). Defaults to the number of configured adapters.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxAdapters *int32 `json:"maxAdapters,omitempty"`
+
+	// MaxCpuAdapters is the maximum number of LoRA adapters stored in CPU memory
+	// (maps to vLLM --max-cpu-loras). Defaults to the number of configured adapters.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxCpuAdapters *int32 `json:"maxCpuAdapters,omitempty"`
 }
 
 // StorageInitializerSpec defines the configuration for the storage initializer.
@@ -250,7 +268,7 @@ type GatewaySpec struct {
 	// Refs provides references to existing, user-managed Gateway objects ("Bring Your Own" gateway).
 	// The controller will use the specified Gateway instead of creating one.
 	// +optional
-	Refs []UntypedObjectReference `json:"refs,omitempty"`
+	Refs []GatewayObjectReference `json:"refs,omitempty"`
 }
 
 // IngressSpec defines the configuration for a Kubernetes Ingress.
@@ -321,9 +339,8 @@ type InferencePoolSpec struct {
 // ScalingSpec configures autoscaling for the LLM inference deployment.
 // When scaling is configured, the controller creates and manages autoscaling resources
 // (VariantAutoscaling CR, ServiceMonitor, and the selected actuator — HPA or KEDA ScaledObject).
-// +kubebuilder:validation:XValidation:rule="has(self.maxReplicas)",message="maxReplicas is required when scaling is configured"
 // +kubebuilder:validation:XValidation:rule="has(self.wva)",message="wva is required when scaling is configured; it provides the autoscaling mechanism"
-// +kubebuilder:validation:XValidation:rule="!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas <= self.maxReplicas",message="minReplicas cannot exceed maxReplicas"
+// +kubebuilder:validation:XValidation:rule="!has(self.minReplicas) || self.minReplicas <= self.maxReplicas",message="minReplicas cannot exceed maxReplicas"
 // +kubebuilder:validation:XValidation:rule="!has(self.wva) || !has(self.wva.keda) || !has(self.wva.keda.idleReplicaCount) || has(self.minReplicas)",message="minReplicas is required when idleReplicaCount is set; idleReplicaCount must be less than minReplicas"
 // +kubebuilder:validation:XValidation:rule="!has(self.wva) || !has(self.wva.keda) || !has(self.wva.keda.idleReplicaCount) || !has(self.minReplicas) || self.wva.keda.idleReplicaCount < self.minReplicas",message="idleReplicaCount must be less than minReplicas; idleReplicaCount defines the replica floor when no triggers are active"
 type ScalingSpec struct {
@@ -332,13 +349,13 @@ type ScalingSpec struct {
 	// For idle scale-down, use KEDA's idleReplicaCount instead.
 	// Defaults to 1 if not specified.
 	// +optional
+	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	MinReplicas *int32 `json:"minReplicas,omitempty"`
 
 	// MaxReplicas is the maximum number of replicas for the deployment.
-	// +optional
 	// +kubebuilder:validation:Minimum=1
-	MaxReplicas *int32 `json:"maxReplicas,omitempty"`
+	MaxReplicas int32 `json:"maxReplicas"`
 
 	// WVA configures the Workload Variant Autoscaler (WVA) for scaling.
 	// WVA scales based on a variety of inference metrics (KV cache utilization, queue depth, etc.)
@@ -368,15 +385,20 @@ type WVASpec struct {
 // +kubebuilder:validation:XValidation:rule="has(self.hpa) || has(self.keda)",message="either hpa or keda must be specified as the actuator backend"
 type ActuatorSpec struct {
 	// HPA configures the HorizontalPodAutoscaler as the actuator backend.
-	// When specified, HPA reads the wva_desired_replicas metric via the Kubernetes Metrics API
-	// (requires Prometheus Adapter) and scales the deployment accordingly.
+	// When specified, HPA reads the wva_desired_replicas metric via the Kubernetes external
+	// metrics API (external.metrics.k8s.io) and scales the deployment accordingly.
+	// Prerequisite: a Prometheus Adapter must be installed and configured in the cluster to
+	// bridge wva_desired_replicas from Prometheus into the Kubernetes external metrics API.
+	// Without it, the HPA will fail to read the metric and stop scaling silently.
 	// Mutually exclusive with KEDA.
 	// +optional
 	HPA *HPAScalingSpec `json:"hpa,omitempty"`
 
 	// KEDA configures a KEDA ScaledObject as the actuator backend.
 	// When specified, KEDA queries Prometheus directly for the wva_desired_replicas metric
-	// and scales the deployment accordingly. KEDA does not require a Prometheus Adapter.
+	// and scales the deployment accordingly. Unlike HPA, KEDA does not require a Prometheus
+	// Adapter — it connects to Prometheus directly using the URL configured in the
+	// autoscaling-wva-controller-config key of the inferenceservice-config ConfigMap.
 	// Mutually exclusive with HPA.
 	// +optional
 	KEDA *KEDAScalingSpec `json:"keda,omitempty"`
@@ -384,6 +406,13 @@ type ActuatorSpec struct {
 
 // HPAScalingSpec configures the HorizontalPodAutoscaler behavior.
 // The fields are directly from the upstream Kubernetes autoscaling/v2 API.
+//
+// Note: HPA-based autoscaling requires a Prometheus Adapter to be pre-installed and
+// configured in the cluster. The Prometheus Adapter exposes the wva_desired_replicas
+// metric published by WVA into the Kubernetes external metrics API (external.metrics.k8s.io),
+// which the HPA reads to make scaling decisions. If the Prometheus Adapter is absent or
+// misconfigured, the HPA will enter an Unknown state and scaling will silently stop.
+// Consider using KEDA instead, which queries Prometheus directly without an adapter.
 type HPAScalingSpec struct {
 	// Behavior configures the scaling behavior of the target in both Up and Down directions
 	// (scaleUp and scaleDown fields respectively).
@@ -464,7 +493,7 @@ type ParallelismSpec struct {
 }
 
 // UntypedObjectReference is a reference to an object without a specific Group/Version/Kind.
-// It's used for referencing networking resources like Gateways and Ingresses where the exact type
+// It's used for referencing networking resources like Ingresses where the exact type
 // might be inferred or is not strictly required by this controller.
 type UntypedObjectReference struct {
 	// Name of the referenced object.
@@ -473,9 +502,97 @@ type UntypedObjectReference struct {
 	Namespace gwapiv1.Namespace `json:"namespace,omitempty"`
 }
 
+// GatewayObjectReference is a reference to a Gateway resource.
+// It extends UntypedObjectReference with Gateway-specific fields.
+type GatewayObjectReference struct {
+	UntypedObjectReference `json:",inline"`
+	// SectionName is the name of a section within the target resource. When
+	// set on a Gateway reference, it targets a specific listener by name.
+	// When unset, the route is attached to all listeners on the referenced
+	// Gateway that support the route type.
+	// +optional
+	SectionName *gwapiv1.SectionName `json:"sectionName,omitempty"`
+}
+
+// ObservedGateway is a Gateway reference with the listeners and HTTPRoutes
+// bound to this service through it. Used in status to record observed routing topology.
+type ObservedGateway struct {
+	// Embedded ObjectReference carries group, kind, name, namespace of the Gateway.
+	gwapiv1.ObjectReference `json:",inline"`
+
+	// Listeners lists the SectionNames of the Gateway listeners that accepted
+	// routes from this service. Nil means the route targets all listeners
+	// (no SectionName was specified on the parentRef).
+	// +optional
+	// +listType=atomic
+	Listeners []gwapiv1.SectionName `json:"listeners,omitempty"`
+
+	// HTTPRoutes lists the HTTPRoutes bound to this service through this Gateway.
+	// +optional
+	// +listType=atomic
+	HTTPRoutes []gwapiv1.ObjectReference `json:"httpRoutes,omitempty"`
+}
+
+// ObservedSchedulerStatus records the scheduler-related resources observed
+// during the last successful routing reconciliation.
+type ObservedSchedulerStatus struct {
+	// InferencePool is the InferencePool observed as active for this service.
+	// +optional
+	InferencePool *gwapiv1.ObjectReference `json:"inferencePool,omitempty"`
+
+	// Service is the EPP Service observed for this service.
+	// +optional
+	Service *gwapiv1.ObjectReference `json:"service,omitempty"`
+}
+
+// RouterStatus records the networking resources observed during the last
+// successful routing reconciliation. Nil when routing is not configured or
+// the service is stopped.
+type RouterStatus struct {
+	// Gateways lists the Gateway resources observed as attached to this service,
+	// each with the listeners and HTTPRoutes bound through them.
+	// +optional
+	// +listType=atomic
+	Gateways []ObservedGateway `json:"gateways,omitempty"`
+
+	// Scheduler records the observed scheduler topology.
+	// Nil when the scheduler is not configured.
+	// +optional
+	Scheduler *ObservedSchedulerStatus `json:"scheduler,omitempty"`
+}
+
+// WorkloadStatus records the workload resources observed during the last
+// successful reconciliation. Nil when no workload resources have been
+// created yet, or when the service is stopped.
+// +optional
+type WorkloadStatus struct {
+	// Primary is the main inference workload (Deployment or LeaderWorkerSet).
+	// When disaggregated serving is configured, this workload handles
+	// the decode phase; otherwise it handles both prefill and decode.
+	// +optional
+	Primary *corev1.TypedLocalObjectReference `json:"primary,omitempty"`
+
+	// Prefill is the prefill workload in disaggregated serving mode.
+	// Nil when disaggregated serving is not configured.
+	// +optional
+	Prefill *corev1.TypedLocalObjectReference `json:"prefill,omitempty"`
+
+	// Service is the Kubernetes Service fronting the primary inference workload.
+	// +optional
+	Service *corev1.TypedLocalObjectReference `json:"service,omitempty"`
+
+	// Scheduler is the EPP scheduler Deployment.
+	// Nil when the scheduler is not configured.
+	// +optional
+	Scheduler *corev1.TypedLocalObjectReference `json:"scheduler,omitempty"`
+}
+
 // LLMInferenceServiceStatus defines the observed state of LLMInferenceService.
 type LLMInferenceServiceStatus struct {
-	// URL of the publicly exposed service.
+	// URL is the primary address for accessing the service.
+	// It is set to an external (public) address when available, otherwise
+	// it is promoted from the first discovered address (which may be
+	// cluster-local or private) for easy discovery.
 	// +optional
 	URL *apis.URL `json:"url,omitempty"`
 
@@ -484,6 +601,15 @@ type LLMInferenceServiceStatus struct {
 
 	// Addressable endpoint for the service, including cluster-local URLs.
 	duckv1.AddressStatus `json:",inline,omitempty"`
+
+	// Router records the observed networking topology for this service.
+	// Nil when routing is not configured or the service is stopped.
+	// +optional
+	Router *RouterStatus `json:"router,omitempty"`
+
+	// Workloads records the observed workload resources for this service.
+	// +optional
+	Workloads *WorkloadStatus `json:"workloads,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

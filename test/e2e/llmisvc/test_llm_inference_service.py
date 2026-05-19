@@ -39,16 +39,16 @@ from .test_resources import (
     ROUTER_ROUTES,
 )
 from .logging import log_execution, logger
-from ..common.http_retry import post_with_retry
+from ..common.http_retry import get_with_retry, post_with_retry
 
 KSERVE_PLURAL_LLMINFERENCESERVICE = "llminferenceservices"
 
 
 def assert_200(response: requests.Response) -> None:
     """Default response assertion that checks for 200 status code."""
-    assert (
-        response.status_code == 200
-    ), f"Service returned {response.status_code}: {response.text}"
+    assert response.status_code == 200, (
+        f"Service returned {response.status_code}: {response.text}"
+    )
 
 
 def assert_200_with_choices(response: requests.Response) -> None:
@@ -66,15 +66,15 @@ def create_response_assertion(
     """Factory for creating flexible response assertions with arbitrary status codes and field checks."""
 
     def response_assertion(response: requests.Response) -> None:
-        assert (
-            response.status_code == status_code
-        ), f"Expected status code {status_code}, but service returned {response.status_code}: {response.text}"
+        assert response.status_code == status_code, (
+            f"Expected status code {status_code}, but service returned {response.status_code}: {response.text}"
+        )
         if with_field:
             body = response.json()
             field_value = body.get(with_field)
-            assert (
-                field_value is not None and len(field_value) > 0
-            ), f"Expected response body to contain non empty field '{with_field}': {response.text}"
+            assert field_value is not None and len(field_value) > 0, (
+                f"Expected response body to contain non empty field '{with_field}': {response.text}"
+            )
 
     return response_assertion
 
@@ -82,9 +82,10 @@ def create_response_assertion(
 @dataclass
 class TestCase:
     """Test case configuration for LLM inference service tests."""
+
     __test__ = False  # So pytest will not try to execute it.
     base_refs: List[str]
-    prompt: str
+    prompt: Optional[str] = None
     service_name: Optional[str] = None
     endpoint: str = "/v1/completions"
     max_tokens: int = 100
@@ -144,6 +145,7 @@ def chat_completions_payload(test_case: TestCase) -> Dict[str, Any]:
                 pytest.mark.cluster_cpu,
                 pytest.mark.cluster_single_node,
                 pytest.mark.llmd_simulator,
+                pytest.mark.custom_gateway,
             ],
         ),
         pytest.param(
@@ -189,7 +191,11 @@ def chat_completions_payload(test_case: TestCase) -> Dict[str, Any]:
                     )
                 ],
             ),
-            marks=[pytest.mark.cluster_cpu, pytest.mark.cluster_single_node],
+            marks=[
+                pytest.mark.cluster_cpu,
+                pytest.mark.cluster_single_node,
+                pytest.mark.custom_gateway,
+            ],
         ),
         pytest.param(
             TestCase(
@@ -237,7 +243,11 @@ def chat_completions_payload(test_case: TestCase) -> Dict[str, Any]:
                     )
                 ],
             ),
-            marks=[pytest.mark.cluster_cpu, pytest.mark.cluster_single_node],
+            marks=[
+                pytest.mark.cluster_cpu,
+                pytest.mark.cluster_single_node,
+                pytest.mark.custom_gateway,
+            ],
         ),
         pytest.param(
             TestCase(
@@ -328,6 +338,26 @@ def chat_completions_payload(test_case: TestCase) -> Dict[str, Any]:
             ),
             marks=[pytest.mark.cluster_cpu, pytest.mark.cluster_single_node],
         ),
+        # Chat completions endpoint coverage
+        pytest.param(
+            TestCase(
+                base_refs=[
+                    "router-managed",
+                    "workload-llmd-simulator",
+                    "model-qwen2.5-0.5b",
+                ],
+                model_name="Qwen/Qwen2.5-0.5B-Instruct",
+                endpoint="/v1/chat/completions",
+                prompt="What is KServe?",
+                payload_formatter=chat_completions_payload,
+                response_assertion=create_response_assertion(with_field="choices"),
+            ),
+            marks=[
+                pytest.mark.cluster_cpu,
+                pytest.mark.cluster_single_node,
+                pytest.mark.llmd_simulator,
+            ],
+        ),
         pytest.param(
             TestCase(
                 base_refs=[
@@ -354,6 +384,39 @@ def chat_completions_payload(test_case: TestCase) -> Dict[str, Any]:
             ),
             marks=[pytest.mark.cluster_cpu, pytest.mark.cluster_single_node],
         ),
+        # Precise prefix KV cache routing test
+        pytest.param(
+            TestCase(
+                base_refs=[
+                    "router-managed",
+                    "scheduler-with-precise-prefix-cache-inline-config",
+                    "workload-llmd-simulator-kvcache",
+                ],
+                prompt="KServe is a",
+                service_name="precise-prefix-cache-test",
+            ),
+            marks=[
+                pytest.mark.cluster_cpu,
+                pytest.mark.cluster_single_node,
+                pytest.mark.llmd_simulator,
+            ],
+        ),
+        # Models endpoint coverage
+        pytest.param(
+            TestCase(
+                base_refs=[
+                    "router-managed",
+                    "workload-llmd-simulator",
+                ],
+                endpoint="/v1/models",
+                response_assertion=create_response_assertion(with_field="data"),
+            ),
+            marks=[
+                pytest.mark.cluster_cpu,
+                pytest.mark.cluster_single_node,
+                pytest.mark.llmd_simulator,
+            ],
+        ),
     ],
     indirect=["test_case"],
     ids=generate_test_id,
@@ -369,6 +432,7 @@ def test_llm_inference_service(test_case: TestCase):  # noqa: F811
 
     service_name = test_case.llm_service.metadata.name
 
+    test_failed = False
     try:
         create_llmisvc(kserve_client, test_case.llm_service)
         wait_for_llm_isvc_ready(
@@ -376,19 +440,12 @@ def test_llm_inference_service(test_case: TestCase):  # noqa: F811
         )
         wait_for_model_response(kserve_client, test_case, test_case.wait_timeout)
     except Exception as e:
+        test_failed = True
         print(f"❌ ERROR: Failed to call llm inference service {service_name}: {e}")
         _collect_diagnostics(kserve_client, test_case.llm_service)
         raise
     finally:
-        try:
-            if os.getenv("SKIP_RESOURCE_DELETION", "False").lower() in (
-                "false",
-                "0",
-                "f",
-            ):
-                delete_llmisvc(kserve_client, test_case.llm_service)
-        except Exception as e:
-            print(f"⚠️ Warning: Failed to cleanup service {service_name}: {e}")
+        maybe_delete_llmisvc(kserve_client, test_case.llm_service, test_failed)
 
 
 @log_execution
@@ -429,6 +486,45 @@ def delete_llmisvc(kserve_client: KServeClient, llm_isvc: V1alpha1LLMInferenceSe
         ) from e
 
 
+def maybe_delete_llmisvc(
+    kserve_client: KServeClient,
+    llm_isvc: V1alpha1LLMInferenceService,
+    test_failed: bool = False,
+):
+    """Delete LLMInferenceService unless env vars instruct otherwise.
+
+    Respects SKIP_RESOURCE_DELETION (skip always) and
+    SKIP_DELETION_ON_FAILURE (skip only when test_failed is True).
+    """
+    service_name = llm_isvc.metadata.name
+    try:
+        skip_all = os.getenv("SKIP_RESOURCE_DELETION", "False").lower() in (
+            "true",
+            "1",
+            "t",
+        )
+        skip_on_failure = os.getenv("SKIP_DELETION_ON_FAILURE", "False").lower() in (
+            "true",
+            "1",
+            "t",
+        )
+
+        should_skip = skip_all or (skip_on_failure and test_failed)
+
+        if not should_skip:
+            delete_llmisvc(kserve_client, llm_isvc)
+        elif skip_all:
+            print(
+                f"⏭️  Skipping deletion of {service_name} (SKIP_RESOURCE_DELETION=True)"
+            )
+        elif test_failed and skip_on_failure:
+            print(
+                f"⏭️  Skipping deletion of {service_name} due to test failure (SKIP_DELETION_ON_FAILURE=True)"
+            )
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to cleanup service {service_name}: {e}")
+
+
 @log_execution
 def get_llmisvc(
     kserve_client: KServeClient,
@@ -456,6 +552,7 @@ def wait_for_model_response(
     kserve_client: KServeClient,
     test_case: TestCase,  # noqa: F811
     timeout_seconds: int = 900,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> str:
     def assert_model_responds():
         try:
@@ -465,30 +562,41 @@ def wait_for_model_response(
 
         model_url = service_url + test_case.endpoint
 
+        headers = {"Content-Type": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
+
         if test_case.payload_formatter is not None:
             test_payload = test_case.payload_formatter(test_case)
-        else:
+        elif test_case.prompt is not None:
             test_payload = {
                 "model": test_case.model_name,
                 "prompt": test_case.prompt,
                 "max_tokens": test_case.max_tokens,
             }
+        else:
+            test_payload = None
 
-        logger.info(
-            f"Calling LLM service at {model_url} with payload {test_payload}"
-        )
+        logger.info(f"Calling LLM service at {model_url} with payload {test_payload}")
         try:
-            response = post_with_retry(
-                model_url,
-                headers={"Content-Type": "application/json"},
-                json_data=test_payload,
-                timeout=test_case.response_timeout,
-            )
+            if test_payload is not None:
+                response = post_with_retry(
+                    model_url,
+                    headers={"Content-Type": "application/json"},
+                    json_data=test_payload,
+                    timeout=test_case.response_timeout,
+                )
+            else:
+                response = get_with_retry(
+                    model_url,
+                    headers={"Accept": "application/json"},
+                    timeout=test_case.response_timeout,
+                )
         except Exception as e:
             logger.error(f"❌ Failed to call model: {e}")
             raise AssertionError(f"❌ Failed to call model: {e}") from e
 
-        logger.info(f"Model response is {response.status_code}")
+        logger.info(f"Model response is {response.status_code}: {response.text[:500]}")
 
         test_case.response_assertion(response)
         return response.text[: test_case.max_tokens]
@@ -587,9 +695,10 @@ def wait_for(
     while True:
         try:
             return assertion_fn()
-        except AssertionError:
+        except AssertionError as e:
             if time.time() >= deadline:
                 raise
+            logger.info("Waiting: %s", e)
             time.sleep(interval)
 
 

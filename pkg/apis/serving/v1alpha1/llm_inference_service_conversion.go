@@ -279,7 +279,11 @@ func convertLoRASpecToV1Alpha2(src *LoRASpec) *v1alpha2.LoRASpec {
 		return nil
 	}
 
-	dst := &v1alpha2.LoRASpec{}
+	dst := &v1alpha2.LoRASpec{
+		MaxRank:        src.MaxRank,
+		MaxAdapters:    src.MaxAdapters,
+		MaxCpuAdapters: src.MaxCpuAdapters,
+	}
 	for _, adapter := range src.Adapters {
 		dst.Adapters = append(dst.Adapters, convertModelSpecToV1Alpha2(&adapter))
 	}
@@ -292,7 +296,11 @@ func convertLoRASpecFromV1Alpha2(src *v1alpha2.LoRASpec) *LoRASpec {
 		return nil
 	}
 
-	dst := &LoRASpec{}
+	dst := &LoRASpec{
+		MaxRank:        src.MaxRank,
+		MaxAdapters:    src.MaxAdapters,
+		MaxCpuAdapters: src.MaxCpuAdapters,
+	}
 	for _, adapter := range src.Adapters {
 		dst.Adapters = append(dst.Adapters, convertModelSpecFromV1Alpha2(&adapter))
 	}
@@ -374,9 +382,12 @@ func convertRouterSpecToV1Alpha2(src *RouterSpec) *v1alpha2.RouterSpec {
 	if src.Gateway != nil {
 		dst.Gateway = &v1alpha2.GatewaySpec{}
 		for _, ref := range src.Gateway.Refs {
-			dst.Gateway.Refs = append(dst.Gateway.Refs, v1alpha2.UntypedObjectReference{
-				Name:      ref.Name,
-				Namespace: ref.Namespace,
+			dst.Gateway.Refs = append(dst.Gateway.Refs, v1alpha2.GatewayObjectReference{
+				UntypedObjectReference: v1alpha2.UntypedObjectReference{
+					Name:      ref.Name,
+					Namespace: ref.Namespace,
+				},
+				SectionName: ref.SectionName,
 			})
 		}
 	}
@@ -455,9 +466,12 @@ func convertRouterSpecFromV1Alpha2(src *v1alpha2.RouterSpec) *RouterSpec {
 	if src.Gateway != nil {
 		dst.Gateway = &GatewaySpec{}
 		for _, ref := range src.Gateway.Refs {
-			dst.Gateway.Refs = append(dst.Gateway.Refs, UntypedObjectReference{
-				Name:      ref.Name,
-				Namespace: ref.Namespace,
+			dst.Gateway.Refs = append(dst.Gateway.Refs, GatewayObjectReference{
+				UntypedObjectReference: UntypedObjectReference{
+					Name:      ref.Name,
+					Namespace: ref.Namespace,
+				},
+				SectionName: ref.SectionName,
 			})
 		}
 	}

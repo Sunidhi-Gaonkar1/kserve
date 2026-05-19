@@ -628,29 +628,32 @@ export RELEASE
 
 GOLANGCI_LINT_VERSION=v2.9.0
 CONTROLLER_TOOLS_VERSION=v0.19.0
-ENVTEST_VERSION=latest
+ENVTEST_VERSION=release-0.19
 YQ_VERSION=v4.52.1
 HELM_VERSION=v3.16.3
-KUSTOMIZE_VERSION=v5.5.0
+KUSTOMIZE_VERSION=v5.8.1
 HELM_DOCS_VERSION=v1.12.0
-BLACK_FMT_VERSION=24.3
 POETRY_VERSION=1.8.3
 UV_VERSION=0.7.8
 RUFF_VERSION=0.14.13
+PINACT_VERSION=v3.9.0
 KIND_VERSION=v0.30.0
 CERT_MANAGER_VERSION=v1.17.0
-ENVOY_GATEWAY_VERSION=v1.6.3
-ENVOY_AI_GATEWAY_VERSION=v0.5.0
+ENVOY_GATEWAY_VERSION=v1.7.0
+ENVOY_AI_GATEWAY_VERSION=v0.6.0
 KNATIVE_OPERATOR_VERSION=v1.21.1
 KNATIVE_SERVING_VERSION=1.21.1
 KEDA_OTEL_ADDON_VERSION=v0.0.6
-KSERVE_VERSION=v0.17.0-rc1
+PROMETHEUS_VERSION=83.4.0
+PROMETHEUS_ADAPTER_VERSION=5.3.0
+KSERVE_VERSION=v0.18.0
 ISTIO_VERSION=1.27.1
-KEDA_VERSION=2.17.3
+KEDA_VERSION=2.18.0
 OPENTELEMETRY_OPERATOR_VERSION=0.74.3
-LWS_VERSION=v0.7.0
+LWS_VERSION=v0.8.0
 GATEWAY_API_VERSION=v1.4.1
-GIE_VERSION=v1.3.0
+GIE_VERSION=v1.3.1
+WVA_VERSION=v0.7.0
 
 #================================================
 # Global Variables (from global-vars.env)
@@ -660,6 +663,9 @@ GIE_VERSION=v1.3.0
 
 KEDA_NAMESPACE="${KEDA_NAMESPACE:-keda}"
 KSERVE_NAMESPACE="${KSERVE_NAMESPACE:-kserve}"
+PROMETHEUS_NAMESPACE="${PROMETHEUS_NAMESPACE:-monitoring}"
+PROMETHEUS_ADAPTER_NAMESPACE="${PROMETHEUS_ADAPTER_NAMESPACE:-monitoring}"
+WVA_NAMESPACE="${WVA_NAMESPACE:-wva-system}"
 OTEL_NAMESPACE="${OTEL_NAMESPACE:-opentelemetry-operator}"
 OPERATOR_NAMESPACE="${OPERATOR_NAMESPACE:-knative-operator}"
 SERVING_NAMESPACE="${SERVING_NAMESPACE:-knative-serving}"
@@ -789,7 +795,7 @@ install_helm() {
     rm -rf "${temp_dir}"
 
     log_success "Successfully installed Helm ${HELM_VERSION} to ${BIN_DIR}/helm"
-    helm version
+    "${BIN_DIR}/helm" version
 }
 
 # ----------------------------------------
@@ -807,7 +813,7 @@ install_yq() {
     log_info "Installing yq ${YQ_VERSION} for ${os}/${arch}..."
 
     if [[ -x "${BIN_DIR}/yq" ]]; then
-        local current_version=$("${BIN_DIR}/yq" --version 2>&1 | grep -oP 'version \K[v0-9.]+')
+        local current_version=$("${BIN_DIR}/yq" --version 2>&1 | awk 'match($0, /v[0-9.]+/) {print substr($0, RSTART, RLENGTH)}')
         # Normalize version format (add 'v' prefix if missing)
         [[ -n "$current_version" && "$current_version" != v* ]] && current_version="v${current_version}"
         if [[ -n "$current_version" ]] && version_gte "$current_version" "$YQ_VERSION"; then
@@ -1269,13 +1275,13 @@ uninstall_kserve_kustomize() {
         # Uninstall overlay resources in reverse order
         for ((i=${#TARGET_OVERLAY_DIRS[@]}-1; i>=0; i--)); do
             log_info "Uninstalling resources from ${TARGET_OVERLAY_DIRS[$i]}..."
-            kubectl kustomize "${TARGET_OVERLAY_DIRS[$i]}" | kubectl delete -f - --force --grace-period=0 2>/dev/null || true
+            kustomize build "${TARGET_OVERLAY_DIRS[$i]}" | kubectl delete -f - --force --grace-period=0 2>/dev/null || true
         done
 
         # Uninstall CRDs in reverse order
         for ((i=${#TARGET_CRD_DIRS[@]}-1; i>=0; i--)); do
             log_info "Uninstalling CRDs from ${TARGET_CRD_DIRS[$i]}..."
-            kubectl kustomize "${TARGET_CRD_DIRS[$i]}" | kubectl delete -f - --force --grace-period=0 2>/dev/null || true
+            kustomize build "${TARGET_CRD_DIRS[$i]}" | kubectl delete -f - --force --grace-period=0 2>/dev/null || true
         done
     fi
 
@@ -1354,12 +1360,6 @@ install_kserve_kustomize() {
                 done
             fi
         done
-
-        # Cleanup temporary overlay
-        if [ "${KSERVE_OVERLAY_DIR}" = "temp" ]; then
-            rm -rf "${REPO_ROOT}/config/overlays/temp"
-            log_info "Temporary overlay directory cleaned up"
-        fi
     fi
 
     if ! is_positive "${USE_LOCAL_CONFIGMAP}"; then
@@ -1441,6 +1441,12 @@ install_kserve_kustomize() {
         else
             retry_command 3 5 kubectl apply --server-side=true -k "${REPO_ROOT}/config/llmisvcconfig"
         fi
+    fi
+
+    # Cleanup temporary overlay after all resources are installed
+    if [ "${KSERVE_OVERLAY_DIR}" = "temp" ]; then
+        rm -rf "${REPO_ROOT}/config/overlays/temp"
+        log_info "Temporary overlay directory cleaned up"
     fi
 
 }
@@ -1563,9 +1569,32 @@ main() {
                 TARGET_CRD_DIRS+=("${REPO_ROOT}/config/crd/full/localmodel")
                 TARGET_CRDS_TO_VERIFY+=("${KSERVE_CRDS}")
                 TARGET_CRDS_TO_VERIFY+=("${LOCALMODEL_CRDS}")
-                TARGET_DEPLOYMENT_NAMES+=("kserve-controller-manager")
-                TARGET_DEPLOYMENT_NAMES+=("kserve-localmodel-controller-manager")
+                test_overlay_deployments="kserve-controller-manager kserve-localmodel-controller-manager"
+                if is_positive "${ENABLE_LLMISVC}"; then
+                    TARGET_CRD_DIRS+=("${REPO_ROOT}/config/crd/full/llmisvc")
+                    TARGET_CRDS_TO_VERIFY+=("${LLMISVC_CRDS}")
+                    test_overlay_deployments+=" llmisvc-controller-manager"
+                fi
+                TARGET_DEPLOYMENT_NAMES+=("${test_overlay_deployments}")
+            elif [ "${KSERVE_OVERLAY_DIR}" == "test-modelcache" ]; then
+                ENABLE_LOCALMODEL="true"
+                ENABLE_LLMISVC="true"
+                INSTALL_LLMISVC_CONFIGS="true"
+        
+                TARGET_CRD_DIRS+=("${REPO_ROOT}/config/crd/full")
+                TARGET_CRD_DIRS+=("${REPO_ROOT}/config/crd/full/localmodel")
+                TARGET_CRD_DIRS+=("${REPO_ROOT}/config/crd/full/llmisvc")
+                TARGET_CRDS_TO_VERIFY+=("${KSERVE_CRDS}")
+                TARGET_CRDS_TO_VERIFY+=("${LOCALMODEL_CRDS}")
+                TARGET_CRDS_TO_VERIFY+=("${LLMISVC_CRDS}")
+                TARGET_DEPLOYMENT_NAMES+=("kserve-controller-manager kserve-localmodel-controller-manager llmisvc-controller-manager")
             elif [ "${KSERVE_OVERLAY_DIR}" == "test-llmisvc" ]; then
+                # Update test-llmisvc overlay image tags if version is set
+                if [ -n "${SET_KSERVE_VERSION}" ]; then
+                    log_info "Updating test-llmisvc overlay image tags to ${SET_KSERVE_VERSION}..."
+                    sed -i -e "s/latest/${SET_KSERVE_VERSION}/g" config/overlays/test-llmisvc/llmisvc_image_patch.yaml
+                    sed -i -e "s/latest/${SET_KSERVE_VERSION}/g" config/configmap/inferenceservice.yaml
+                fi
                 TARGET_CRD_DIRS+=("${REPO_ROOT}/config/crd/full/llmisvc")
                 TARGET_CRDS_TO_VERIFY+=("${LLMISVC_CRDS}")
                 TARGET_DEPLOYMENT_NAMES+=("llmisvc-controller-manager")
@@ -1943,7 +1972,7 @@ spec:
       value: "8080"
     - name: MLSERVER_GRPC_PORT
       value: "9000"
-    image: docker.io/seldonio/mlserver:1.5.0
+    image: docker.io/seldonio/mlserver:1.7.1
     name: kserve-container
     resources:
       limits:
@@ -2381,158 +2410,15 @@ spec:
   template:
     containers:
     - command:
-      - vllm
-      - serve
-      - /mnt/models
-      - --served-model-name
-      - '{{ .Spec.Model.Name }}'
-      - --port
-      - "8001"
-      env:
-      - name: HOME
-        value: /home
-      - name: VLLM_LOGGING_LEVEL
-        value: INFO
-      - name: HF_HUB_CACHE
-        value: /models
-      image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
-      imagePullPolicy: IfNotPresent
-      livenessProbe:
-        failureThreshold: 3
-        httpGet:
-          path: /health
-          port: 8001
-          scheme: HTTP
-        periodSeconds: 10
-        timeoutSeconds: 10
-      name: main
-      ports:
-      - containerPort: 8001
-        protocol: TCP
-      readinessProbe:
-        failureThreshold: 60
-        httpGet:
-          path: /health
-          port: 8001
-          scheme: HTTP
-        periodSeconds: 10
-        timeoutSeconds: 5
-      securityContext:
-        allowPrivilegeEscalation: false
-        capabilities:
-          drop:
-          - ALL
-        readOnlyRootFilesystem: false
-        runAsNonRoot: false
-        seccompProfile:
-          type: RuntimeDefault
-      startupProbe:
-        failureThreshold: 60
-        httpGet:
-          path: /health
-          port: 8001
-          scheme: HTTP
-        periodSeconds: 10
-      terminationMessagePath: /dev/termination-log
-      terminationMessagePolicy: FallbackToLogsOnError
-      volumeMounts:
-      - mountPath: /home
-        name: home
-      - mountPath: /dev/shm
-        name: dshm
-      - mountPath: /models
-        name: model-cache
-      - mountPath: /var/run/kserve/tls
-        name: tls-certs
-        readOnly: true
-    initContainers:
-    - args:
-      - --port=8000
-      - --vllm-port=8001
-      - --connector=nixlv2
-      - --secure-proxy=false
-      env:
-      - name: INFERENCE_POOL_NAMESPACE
-        valueFrom:
-          fieldRef:
-            fieldPath: metadata.namespace
-      image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.4.0
-      imagePullPolicy: IfNotPresent
-      livenessProbe:
-        failureThreshold: 3
-        httpGet:
-          path: /health
-          port: 8000
-          scheme: HTTP
-        initialDelaySeconds: 10
-        periodSeconds: 10
-        timeoutSeconds: 10
-      name: llm-d-routing-sidecar
-      ports:
-      - containerPort: 8000
-        protocol: TCP
-      readinessProbe:
-        failureThreshold: 10
-        httpGet:
-          path: /health
-          port: 8000
-          scheme: HTTP
-        initialDelaySeconds: 10
-        periodSeconds: 10
-        timeoutSeconds: 5
-      resources: {}
-      restartPolicy: Always
-      securityContext:
-        allowPrivilegeEscalation: false
-        capabilities:
-          drop:
-          - ALL
-        readOnlyRootFilesystem: false
-        runAsNonRoot: false
-      terminationMessagePath: /dev/termination-log
-      terminationMessagePolicy: FallbackToLogsOnError
-      volumeMounts:
-      - mountPath: /var/run/kserve/tls
-        name: tls-certs
-        readOnly: true
-    terminationGracePeriodSeconds: 30
-    volumes:
-    - emptyDir: {}
-      name: home
-    - emptyDir:
-        medium: Memory
-        sizeLimit: 1Gi
-      name: dshm
-    - emptyDir: {}
-      name: model-cache
-    - name: tls-certs
-      secret:
-        secretName: '{{ ChildName .ObjectMeta.Name `-kserve-self-signed-certs` }}'
----
-apiVersion: serving.kserve.io/v1alpha2
-kind: LLMInferenceServiceConfig
-metadata:
-  name: kserve-config-llm-decode-worker-data-parallel
-  namespace: kserve
-spec:
-  template:
-    containers:
-    - command:
       - /bin/bash
       - -c
       - |-
-        # In some versions, ZMQ bind doesn't resolve the address through DNS
-        DP_ADDRESS=$(getent hosts "${LWS_LEADER_ADDRESS}" | cut -d' ' -f1)
-        if [ -z "${DP_ADDRESS}" ]; then
-          echo "ERROR: Failed to resolve LWS_LEADER_ADDRESS='${LWS_LEADER_ADDRESS}'" >&2
-          exit 1
-        fi
-        echo "DP_ADDRESS=${DP_ADDRESS}"
-
         if [ "$KSERVE_INFER_ROCE" = "true" ]; then
           echo "Trying to infer RoCE configs ... "
           grep -H . /sys/class/infiniband/*/ports/*/gids/* 2>/dev/null
           grep -H . /sys/class/infiniband/*/ports/*/gid_attrs/types/* 2>/dev/null
+
+          cat /proc/driver/nvidia/params
 
           KSERVE_INFER_IB_GID_INDEX_GREP=${KSERVE_INFER_IB_GID_INDEX_GREP:-"RoCE v2"}
 
@@ -2567,7 +2453,313 @@ spec:
               hcas=$(IFS=,; echo "${active_hcas[*]}")
               echo "[Infer RoCE] Setting active HCAs: ${hcas}"
               export NCCL_IB_HCA=${NCCL_IB_HCA:-${hcas}}
-              export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${hcas}}
+              export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${ucx_hcas}}
+              export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${ucx_hcas}}
+
+              echo "[Infer RoCE] NCCL_IB_HCA=${NCCL_IB_HCA}"
+              echo "[Infer RoCE] NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST}"
+          else
+              echo "[Infer RoCE] WARNING: No active RoCE HCAs found. NCCL_IB_HCA will not be set."
+          fi
+
+          if [ ${#active_hcas[@]} -gt 0 ]; then
+              echo "[Infer RoCE] Finding GID_INDEX for each active HCA (SR-IOV compatible)..."
+
+              # For SR-IOV environments, find the most common IPv4 RoCE v2 GID index across all HCAs
+              declare -A gid_index_count
+              declare -A hca_gid_index
+
+              for hca_name in "${active_hcas[@]}"; do
+                  echo "[Infer RoCE] Processing HCA: ${hca_name}"
+
+                  # Find all RoCE v2 IPv4 GIDs for this HCA and count by index
+                  for tpath in /sys/class/infiniband/${hca_name}/ports/1/gid_attrs/types/*; do
+                      if grep -q "${KSERVE_INFER_IB_GID_INDEX_GREP}" "$tpath" 2>/dev/null; then
+                          idx=$(basename "$tpath")
+                          gid_file="/sys/class/infiniband/${hca_name}/ports/1/gids/${idx}"
+                          # Check for IPv4 GID (contains ffff:)
+                          if [ -f "$gid_file" ] && grep -q "ffff:" "$gid_file"; then
+                              gid_value=$(cat "$gid_file" 2>/dev/null || echo "")
+                              echo "[Infer RoCE] Found IPv4 RoCE v2 GID for ${hca_name}: index=${idx}, gid=${gid_value}"
+                              hca_gid_index["${hca_name}"]="${idx}"
+                              gid_index_count["${idx}"]=$((${gid_index_count["${idx}"]} + 1))
+                              break  # Use first found IPv4 GID per HCA
+                          fi
+                      fi
+                  done
+              done
+
+              # Find the most common GID index (most likely to be consistent across nodes)
+              best_gid_index=""
+              max_count=0
+              for idx in "${!gid_index_count[@]}"; do
+                  count=${gid_index_count["${idx}"]}
+                  echo "[Infer RoCE] GID_INDEX ${idx} found on ${count} HCAs"
+                  if [ $count -gt $max_count ]; then
+                      max_count=$count
+                      best_gid_index="$idx"
+                  fi
+              done
+
+              # Use deterministic fallback if counts are equal - prefer lower index number
+              if [ ${#gid_index_count[@]} -gt 1 ]; then
+                  echo "[Infer RoCE] Multiple GID indices found, selecting most common: ${best_gid_index}"
+                  # If there's a tie, prefer index 3 as it's most common in SR-IOV setups
+                  if [ -n "${gid_index_count['3']}" ] && [ "${gid_index_count['3']}" -eq "$max_count" ]; then
+                      best_gid_index="3"
+                      echo "[Infer RoCE] Using deterministic fallback: GID_INDEX=3 (SR-IOV standard)"
+                  fi
+              fi
+
+              # Check if GID_INDEX is already set via environment variables
+              if [ -n "${NCCL_IB_GID_INDEX}" ]; then
+                  echo "[Infer RoCE] Using pre-configured NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX} from environment"
+                  export NVSHMEM_IB_GID_INDEX=${NVSHMEM_IB_GID_INDEX:-$NCCL_IB_GID_INDEX}
+                  export UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-$NCCL_IB_GID_INDEX}
+                  echo "[Infer RoCE] Using hardcoded GID_INDEX=${NCCL_IB_GID_INDEX} for NCCL, NVSHMEM, and UCX"
+              elif [ -n "$best_gid_index" ]; then
+                  echo "[Infer RoCE] Selected GID_INDEX: ${best_gid_index} (found on ${max_count} HCAs)"
+
+                  export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-$best_gid_index}
+                  export NVSHMEM_IB_GID_INDEX=${NVSHMEM_IB_GID_INDEX:-$best_gid_index}
+                  export UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-$best_gid_index}
+
+                  echo "[Infer RoCE] Exported GID_INDEX=${best_gid_index} for NCCL, NVSHMEM, and UCX"
+              else
+                  echo "[Infer RoCE] ERROR: No valid IPv4 ${KSERVE_INFER_IB_GID_INDEX_GREP} GID_INDEX found on any HCA."
+              fi
+          else
+              echo "[Infer RoCE] No active HCAs found, skipping GID_INDEX inference."
+          fi
+        fi
+
+        # --disable-access-log-for-endpoints landed in vLLM 0.16.0 (vllm-project/vllm#30011).
+        # Older versions still need the blanket --disable-uvicorn-access-log.
+        ACCESS_LOG_ARGS="--disable-uvicorn-access-log"
+        VLLM_VERSION=$(vllm --version 2>/dev/null | tail -1 | awk '{print $NF}')
+        echo "[access-log-detect] vllm version='${VLLM_VERSION}'"
+        if [[ "$VLLM_VERSION" =~ ^[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "0.16.0" "${VLLM_VERSION}" | sort -V | head -1)" = "0.16.0" ]; then
+          ACCESS_LOG_ARGS="--disable-access-log-for-endpoints /health,/metrics,/ping"
+        fi
+        echo "[access-log-detect] selected ACCESS_LOG_ARGS='${ACCESS_LOG_ARGS}'"
+
+        eval "vllm serve /mnt/models \
+          --served-model-name "{{ .Spec.Model.Name }}" \
+          --port 8001 \
+          ${ACCESS_LOG_ARGS} \
+          {{ if .GlobalConfig.EnableTLS }}--enable-ssl-refresh{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
+          ${VLLM_ADDITIONAL_ARGS} \
+          $@"
+      - --
+      env:
+      - name: HOME
+        value: /home
+      - name: VLLM_LOGGING_LEVEL
+        value: INFO
+      - name: HF_HUB_CACHE
+        value: /models
+      image: ghcr.io/llm-d/llm-d-cuda:v0.6.0
+      imagePullPolicy: IfNotPresent
+      livenessProbe:
+        failureThreshold: 3
+        httpGet:
+          path: /health
+          port: 8001
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+        periodSeconds: 10
+        timeoutSeconds: 10
+      name: main
+      ports:
+      - containerPort: 8001
+        protocol: TCP
+      readinessProbe:
+        failureThreshold: 60
+        httpGet:
+          path: /health
+          port: 8001
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+        periodSeconds: 10
+        timeoutSeconds: 5
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+          - ALL
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      startupProbe:
+        failureThreshold: 60
+        httpGet:
+          path: /health
+          port: 8001
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+        periodSeconds: 10
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: FallbackToLogsOnError
+      volumeMounts:
+      - mountPath: /home
+        name: home
+      - mountPath: /tmp
+        name: tmp-dir
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /models
+        name: model-cache
+      - mountPath: /var/run/kserve/tls
+        name: tls-certs
+        readOnly: true
+    initContainers:
+    - command:
+      - /app/pd-sidecar
+      - --port=8000
+      - --vllm-port=8001
+      - --kv-connector=nixlv2
+      - --enable-ssrf-protection=true
+      - --pool-group=inference.networking.x-k8s.io
+      - '{{ if .GlobalConfig.EnableTLS }}--secure-proxy=true{{else}}--secure-proxy=false{{-
+        end }}'
+      - '{{ if .GlobalConfig.EnableTLS }}--cert-path=/var/run/kserve/tls{{- end }}'
+      - '{{ if .GlobalConfig.EnableTLS }}--decoder-use-tls=true{{- end }}'
+      - '{{ if .GlobalConfig.EnableTLS }}--prefiller-use-tls=true{{- end }}'
+      env:
+      - name: INFERENCE_POOL_NAMESPACE
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.namespace
+      - name: SSL_CERT_DIR
+        value: /var/run/kserve/tls:/var/run/secrets/kubernetes.io/serviceaccount:/etc/pki/tls/certs
+      image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.7.1
+      imagePullPolicy: IfNotPresent
+      livenessProbe:
+        failureThreshold: 3
+        httpGet:
+          path: /health
+          port: 8000
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        timeoutSeconds: 10
+      name: llm-d-routing-sidecar
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      readinessProbe:
+        failureThreshold: 10
+        httpGet:
+          path: /health
+          port: 8000
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        timeoutSeconds: 5
+      resources: {}
+      restartPolicy: Always
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+          - ALL
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: FallbackToLogsOnError
+      volumeMounts:
+      - mountPath: /var/run/kserve/tls
+        name: tls-certs
+        readOnly: true
+    terminationGracePeriodSeconds: 30
+    volumes:
+    - emptyDir: {}
+      name: home
+    - emptyDir: {}
+      name: tmp-dir
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 1Gi
+      name: dshm
+    - emptyDir: {}
+      name: model-cache
+    - name: tls-certs
+      secret:
+        secretName: '{{ ChildName .ObjectMeta.Name `-kserve-self-signed-certs` }}'
+---
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceServiceConfig
+metadata:
+  name: kserve-config-llm-decode-worker-data-parallel
+  namespace: kserve
+spec:
+  template:
+    containers:
+    - command:
+      - /bin/bash
+      - -c
+      - |-
+        # In some versions, ZMQ bind doesn't resolve the address through DNS
+        # Retry DP_ADDRESS resolution (configurable attempts, default 30)
+        RESOLVE_ATTEMPTS=${DP_ADDRESS_RESOLVE_ATTEMPTS:-30}
+        for ((i=1; i<=RESOLVE_ATTEMPTS; i++)); do
+          DP_ADDRESS=$(getent hosts ${LWS_LEADER_ADDRESS} | cut -d' ' -f1)
+          if [ -n "$DP_ADDRESS" ]; then
+            echo "DP_ADDRESS=${DP_ADDRESS} (resolved on attempt $i)"
+            break
+          else
+            echo "DP_ADDRESS resolution failed on attempt $i, retrying..."
+            sleep 1
+          fi
+        done
+
+        if [ -z "$DP_ADDRESS" ]; then
+          echo "WARNING: Failed to resolve DP_ADDRESS after ${RESOLVE_ATTEMPTS} attempts, falling back to LWS_LEADER_ADDRESS"
+          DP_ADDRESS=${LWS_LEADER_ADDRESS}
+          echo "DP_ADDRESS=${DP_ADDRESS} (fallback)"
+        fi
+
+        if [ "$KSERVE_INFER_ROCE" = "true" ]; then
+          echo "Trying to infer RoCE configs ... "
+          grep -H . /sys/class/infiniband/*/ports/*/gids/* 2>/dev/null
+          grep -H . /sys/class/infiniband/*/ports/*/gid_attrs/types/* 2>/dev/null
+
+          cat /proc/driver/nvidia/params
+
+          KSERVE_INFER_IB_GID_INDEX_GREP=${KSERVE_INFER_IB_GID_INDEX_GREP:-"RoCE v2"}
+
+          echo "[Infer RoCE] Discovering active HCAs ..."
+          active_hcas=()
+          # Loop through all mlx5 devices found in sysfs
+          for hca_dir in /sys/class/infiniband/mlx5_*; do
+              # Ensure it's a directory before proceeding
+              if [ -d "$hca_dir" ]; then
+                  hca_name=$(basename "$hca_dir")
+                  port_state_file="$hca_dir/ports/1/state" # Assume port 1
+                  type_file="$hca_dir/ports/1/gid_attrs/types/*"
+
+                  echo "[Infer RoCE] Check if the port state file ${port_state_file} exists and contains 'ACTIVE'"
+                  if [ -f "$port_state_file" ] && grep -q "ACTIVE" "$port_state_file" && grep -q "${KSERVE_INFER_IB_GID_INDEX_GREP}" ${type_file} 2>/dev/null; then
+                      echo "[Infer RoCE] Found active HCA: $hca_name"
+                      active_hcas+=("$hca_name")
+                  else
+                      echo "[Infer RoCE] Skipping inactive or down HCA: $hca_name"
+                  fi
+              fi
+          done
+
+          ucx_hcas=()
+          for hca in "${active_hcas[@]}"; do
+            ucx_hcas+=("${hca}:1")
+          done
+
+          # Check if we found any active HCAs
+          if [ ${#active_hcas[@]} -gt 0 ]; then
+              # Join the array elements with a comma
+              hcas=$(IFS=,; echo "${active_hcas[*]}")
+              echo "[Infer RoCE] Setting active HCAs: ${hcas}"
+              export NCCL_IB_HCA=${NCCL_IB_HCA:-${hcas}}
+              export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${ucx_hcas}}
               export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${ucx_hcas}}
 
               echo "[Infer RoCE] NCCL_IB_HCA=${NCCL_IB_HCA}"
@@ -2648,6 +2840,17 @@ spec:
         fi
 
         START_RANK=0
+
+        # --disable-access-log-for-endpoints landed in vLLM 0.16.0 (vllm-project/vllm#30011).
+        # Older versions still need the blanket --disable-uvicorn-access-log.
+        ACCESS_LOG_ARGS="--disable-uvicorn-access-log"
+        VLLM_VERSION=$(vllm --version 2>/dev/null | tail -1 | awk '{print $NF}')
+        echo "[access-log-detect] vllm version='${VLLM_VERSION}'"
+        if [[ "$VLLM_VERSION" =~ ^[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "0.16.0" "${VLLM_VERSION}" | sort -V | head -1)" = "0.16.0" ]; then
+          ACCESS_LOG_ARGS="--disable-access-log-for-endpoints /health,/metrics,/ping"
+        fi
+        echo "[access-log-detect] selected ACCESS_LOG_ARGS='${ACCESS_LOG_ARGS}'"
+
         eval "vllm serve \
           /mnt/models \
           --served-model-name "{{ .Spec.Model.Name }}" \
@@ -2660,15 +2863,12 @@ spec:
           --data-parallel-address ${DP_ADDRESS} \
           --data-parallel-rpc-port {{ if .Spec.Parallelism.DataRPCPort }}{{ .Spec.Parallelism.DataRPCPort }}{{ else }}5555{{- end }} \
           --data-parallel-start-rank $START_RANK \
+          ${ACCESS_LOG_ARGS} \
+          {{ if .GlobalConfig.EnableTLS }}--enable-ssl-refresh{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
           ${VLLM_ADDITIONAL_ARGS} \
-          $@ \
-          --trust-remote-code"
-          # BackendTLSPolicy is not implemented yet so disable SSL for now
-          # --enable-ssl-refresh \
-          # --ssl-certfile \
-          # /var/run/kserve/tls/tls.crt \
-          # --ssl-keyfile \
-          # /var/run/kserve/tls/tls.key"
+          $@"
       - --
       env:
       - name: HOME
@@ -2677,14 +2877,14 @@ spec:
         value: INFO
       - name: HF_HUB_CACHE
         value: /models
-      image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+      image: ghcr.io/llm-d/llm-d-cuda:v0.6.0
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 3
         httpGet:
           path: /health
           port: 8001
-          scheme: HTTP
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
         periodSeconds: 10
         timeoutSeconds: 10
       name: main
@@ -2696,7 +2896,7 @@ spec:
         httpGet:
           path: /health
           port: 8001
-          scheme: HTTP
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
         periodSeconds: 30
         timeoutSeconds: 5
       securityContext:
@@ -2708,8 +2908,8 @@ spec:
           - NET_RAW
           drop:
           - ALL
-        readOnlyRootFilesystem: false
-        runAsNonRoot: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       startupProbe:
@@ -2717,13 +2917,15 @@ spec:
         httpGet:
           path: /health
           port: 8001
-          scheme: HTTP
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
         periodSeconds: 10
       terminationMessagePath: /dev/termination-log
       terminationMessagePolicy: FallbackToLogsOnError
       volumeMounts:
       - mountPath: /home
         name: home
+      - mountPath: /tmp
+        name: tmp-dir
       - mountPath: /dev/shm
         name: dshm
       - mountPath: /models
@@ -2732,24 +2934,33 @@ spec:
         name: tls-certs
         readOnly: true
     initContainers:
-    - args:
+    - command:
+      - /app/pd-sidecar
       - --port=8000
       - --vllm-port=8001
-      - --connector=nixlv2
-      - --secure-proxy=false
+      - --kv-connector=nixlv2
+      - --enable-ssrf-protection=true
+      - --pool-group=inference.networking.x-k8s.io
+      - '{{ if .GlobalConfig.EnableTLS }}--secure-proxy=true{{else}}--secure-proxy=false{{-
+        end }}'
+      - '{{ if .GlobalConfig.EnableTLS }}--cert-path=/var/run/kserve/tls{{- end }}'
+      - '{{ if .GlobalConfig.EnableTLS }}--decoder-use-tls=true{{- end }}'
+      - '{{ if .GlobalConfig.EnableTLS }}--prefiller-use-tls=true{{- end }}'
       env:
       - name: INFERENCE_POOL_NAMESPACE
         valueFrom:
           fieldRef:
             fieldPath: metadata.namespace
-      image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.4.0
+      - name: SSL_CERT_DIR
+        value: /var/run/kserve/tls:/var/run/secrets/kubernetes.io/serviceaccount:/etc/pki/tls/certs
+      image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.7.1
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 3
         httpGet:
           path: /health
           port: 8000
-          scheme: HTTP
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
         initialDelaySeconds: 10
         periodSeconds: 10
         timeoutSeconds: 10
@@ -2762,7 +2973,7 @@ spec:
         httpGet:
           path: /health
           port: 8000
-          scheme: HTTP
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
         initialDelaySeconds: 10
         periodSeconds: 10
         timeoutSeconds: 5
@@ -2773,7 +2984,7 @@ spec:
           drop:
           - ALL
         readOnlyRootFilesystem: true
-        runAsNonRoot: false
+        runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       terminationMessagePath: /dev/termination-log
@@ -2786,6 +2997,8 @@ spec:
     volumes:
     - emptyDir: {}
       name: home
+    - emptyDir: {}
+      name: tmp-dir
     - emptyDir:
         medium: Memory
         sizeLimit: 8Gi
@@ -2802,17 +3015,31 @@ spec:
       - -c
       - |-
         # In some versions, ZMQ bind doesn't resolve the address through DNS
-        DP_ADDRESS=$(getent hosts "${LWS_LEADER_ADDRESS}" | cut -d' ' -f1)
-        if [ -z "${DP_ADDRESS}" ]; then
-          echo "ERROR: Failed to resolve LWS_LEADER_ADDRESS='${LWS_LEADER_ADDRESS}'" >&2
-          exit 1
+        # Retry DP_ADDRESS resolution (configurable attempts, default 30)
+        RESOLVE_ATTEMPTS=${DP_ADDRESS_RESOLVE_ATTEMPTS:-30}
+        for ((i=1; i<=RESOLVE_ATTEMPTS; i++)); do
+          DP_ADDRESS=$(getent hosts ${LWS_LEADER_ADDRESS} | cut -d' ' -f1)
+          if [ -n "$DP_ADDRESS" ]; then
+            echo "DP_ADDRESS=${DP_ADDRESS} (resolved on attempt $i)"
+            break
+          else
+            echo "DP_ADDRESS resolution failed on attempt $i, retrying..."
+            sleep 1
+          fi
+        done
+
+        if [ -z "$DP_ADDRESS" ]; then
+          echo "WARNING: Failed to resolve DP_ADDRESS after ${RESOLVE_ATTEMPTS} attempts, falling back to LWS_LEADER_ADDRESS"
+          DP_ADDRESS=${LWS_LEADER_ADDRESS}
+          echo "DP_ADDRESS=${DP_ADDRESS} (fallback)"
         fi
-        echo "DP_ADDRESS=${DP_ADDRESS}"
 
         if [ "$KSERVE_INFER_ROCE" = "true" ]; then
           echo "Trying to infer RoCE configs ... "
           grep -H . /sys/class/infiniband/*/ports/*/gids/* 2>/dev/null
           grep -H . /sys/class/infiniband/*/ports/*/gid_attrs/types/* 2>/dev/null
+
+          cat /proc/driver/nvidia/params
 
           KSERVE_INFER_IB_GID_INDEX_GREP=${KSERVE_INFER_IB_GID_INDEX_GREP:-"RoCE v2"}
 
@@ -2847,7 +3074,7 @@ spec:
               hcas=$(IFS=,; echo "${active_hcas[*]}")
               echo "[Infer RoCE] Setting active HCAs: ${hcas}"
               export NCCL_IB_HCA=${NCCL_IB_HCA:-${hcas}}
-              export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${hcas}}
+              export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${ucx_hcas}}
               export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${ucx_hcas}}
 
               echo "[Infer RoCE] NCCL_IB_HCA=${NCCL_IB_HCA}"
@@ -2928,6 +3155,17 @@ spec:
         fi
 
         START_RANK=$(( ${LWS_WORKER_INDEX:-0} * {{ or .Spec.Parallelism.DataLocal 1 }} ))
+
+        # --disable-access-log-for-endpoints landed in vLLM 0.16.0 (vllm-project/vllm#30011).
+        # Older versions still need the blanket --disable-uvicorn-access-log.
+        ACCESS_LOG_ARGS="--disable-uvicorn-access-log"
+        VLLM_VERSION=$(vllm --version 2>/dev/null | tail -1 | awk '{print $NF}')
+        echo "[access-log-detect] vllm version='${VLLM_VERSION}'"
+        if [[ "$VLLM_VERSION" =~ ^[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "0.16.0" "${VLLM_VERSION}" | sort -V | head -1)" = "0.16.0" ]; then
+          ACCESS_LOG_ARGS="--disable-access-log-for-endpoints /health,/metrics,/ping"
+        fi
+        echo "[access-log-detect] selected ACCESS_LOG_ARGS='${ACCESS_LOG_ARGS}'"
+
         eval "vllm serve \
           /mnt/models \
           --served-model-name "{{ .Spec.Model.Name }}" \
@@ -2939,16 +3177,13 @@ spec:
           --data-parallel-address ${DP_ADDRESS} \
           --data-parallel-rpc-port {{ if .Spec.Parallelism.DataRPCPort }}{{ .Spec.Parallelism.DataRPCPort }}{{ else }}5555{{- end }} \
           --data-parallel-start-rank $START_RANK \
+          --headless \
+          ${ACCESS_LOG_ARGS} \
+          {{ if .GlobalConfig.EnableTLS }}--enable-ssl-refresh{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
           ${VLLM_ADDITIONAL_ARGS} \
-          $@ \
-          --trust-remote-code \
-          --headless"
-          # BackendTLSPolicy is not implemented yet so disable SSL for now
-          # --enable-ssl-refresh \
-          # --ssl-certfile \
-          # /var/run/kserve/tls/tls.crt \
-          # --ssl-keyfile \
-          # /var/run/kserve/tls/tls.key"
+          $@"
       - --
       env:
       - name: HOME
@@ -2959,7 +3194,7 @@ spec:
         value: /models
       - name: VLLM_RANDOMIZE_DP_DUMMY_INPUTS
         value: "1"
-      image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+      image: ghcr.io/llm-d/llm-d-cuda:v0.6.0
       imagePullPolicy: IfNotPresent
       name: main
       ports:
@@ -2974,8 +3209,8 @@ spec:
           - NET_RAW
           drop:
           - ALL
-        readOnlyRootFilesystem: false
-        runAsNonRoot: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       terminationMessagePath: /dev/termination-log
@@ -2983,6 +3218,8 @@ spec:
       volumeMounts:
       - mountPath: /home
         name: home
+      - mountPath: /tmp
+        name: tmp-dir
       - mountPath: /dev/shm
         name: dshm
       - mountPath: /models
@@ -2994,6 +3231,8 @@ spec:
     volumes:
     - emptyDir: {}
       name: home
+    - emptyDir: {}
+      name: tmp-dir
     - emptyDir:
         medium: Memory
         sizeLimit: 8Gi
@@ -3014,109 +3253,15 @@ spec:
     template:
       containers:
       - command:
-        - vllm
-        - serve
-        - /mnt/models
-        - --served-model-name
-        - '{{ .Spec.Model.Name }}'
-        - --port
-        - "8000"
-        env:
-        - name: HOME
-          value: /home
-        - name: VLLM_LOGGING_LEVEL
-          value: INFO
-        - name: HF_HUB_CACHE
-          value: /models
-        image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
-        imagePullPolicy: IfNotPresent
-        livenessProbe:
-          failureThreshold: 3
-          httpGet:
-            path: /health
-            port: 8000
-            scheme: HTTP
-          periodSeconds: 10
-          timeoutSeconds: 10
-        name: main
-        ports:
-        - containerPort: 8000
-          protocol: TCP
-        readinessProbe:
-          failureThreshold: 60
-          httpGet:
-            path: /health
-            port: 8000
-            scheme: HTTP
-          periodSeconds: 10
-          timeoutSeconds: 5
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-          readOnlyRootFilesystem: false
-          runAsNonRoot: false
-          seccompProfile:
-            type: RuntimeDefault
-        startupProbe:
-          failureThreshold: 60
-          httpGet:
-            path: /health
-            port: 8000
-            scheme: HTTP
-          periodSeconds: 10
-        terminationMessagePath: /dev/termination-log
-        terminationMessagePolicy: File
-        volumeMounts:
-        - mountPath: /home
-          name: home
-        - mountPath: /dev/shm
-          name: dshm
-        - mountPath: /models
-          name: model-cache
-        - mountPath: /var/run/kserve/tls
-          name: tls-certs
-          readOnly: true
-      terminationGracePeriodSeconds: 30
-      volumes:
-      - emptyDir: {}
-        name: home
-      - emptyDir:
-          medium: Memory
-          sizeLimit: 1Gi
-        name: dshm
-      - emptyDir: {}
-        name: model-cache
-      - name: tls-certs
-        secret:
-          secretName: '{{ ChildName .ObjectMeta.Name `-kserve-self-signed-certs` }}'
----
-apiVersion: serving.kserve.io/v1alpha2
-kind: LLMInferenceServiceConfig
-metadata:
-  name: kserve-config-llm-prefill-worker-data-parallel
-  namespace: kserve
-spec:
-  prefill:
-    template:
-      containers:
-      - command:
         - /bin/bash
         - -c
         - |-
-          # In some versions, ZMQ bind doesn't resolve the address through DNS
-          DP_ADDRESS=$(getent hosts "${LWS_LEADER_ADDRESS}" | cut -d' ' -f1)
-          if [ -z "${DP_ADDRESS}" ]; then
-            echo "ERROR: Failed to resolve LWS_LEADER_ADDRESS='${LWS_LEADER_ADDRESS}'" >&2
-            exit 1
-          fi
-          echo "DP_ADDRESS=${DP_ADDRESS}"
-
           if [ "$KSERVE_INFER_ROCE" = "true" ]; then
             echo "Trying to infer RoCE configs ... "
             grep -H . /sys/class/infiniband/*/ports/*/gids/* 2>/dev/null
             grep -H . /sys/class/infiniband/*/ports/*/gid_attrs/types/* 2>/dev/null
+
+            cat /proc/driver/nvidia/params
 
             KSERVE_INFER_IB_GID_INDEX_GREP=${KSERVE_INFER_IB_GID_INDEX_GREP:-"RoCE v2"}
 
@@ -3151,7 +3296,255 @@ spec:
                 hcas=$(IFS=,; echo "${active_hcas[*]}")
                 echo "[Infer RoCE] Setting active HCAs: ${hcas}"
                 export NCCL_IB_HCA=${NCCL_IB_HCA:-${hcas}}
-                export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${hcas}}
+                export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${ucx_hcas}}
+                export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${ucx_hcas}}
+
+                echo "[Infer RoCE] NCCL_IB_HCA=${NCCL_IB_HCA}"
+                echo "[Infer RoCE] NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST}"
+            else
+                echo "[Infer RoCE] WARNING: No active RoCE HCAs found. NCCL_IB_HCA will not be set."
+            fi
+
+            if [ ${#active_hcas[@]} -gt 0 ]; then
+                echo "[Infer RoCE] Finding GID_INDEX for each active HCA (SR-IOV compatible)..."
+
+                # For SR-IOV environments, find the most common IPv4 RoCE v2 GID index across all HCAs
+                declare -A gid_index_count
+                declare -A hca_gid_index
+
+                for hca_name in "${active_hcas[@]}"; do
+                    echo "[Infer RoCE] Processing HCA: ${hca_name}"
+
+                    # Find all RoCE v2 IPv4 GIDs for this HCA and count by index
+                    for tpath in /sys/class/infiniband/${hca_name}/ports/1/gid_attrs/types/*; do
+                        if grep -q "${KSERVE_INFER_IB_GID_INDEX_GREP}" "$tpath" 2>/dev/null; then
+                            idx=$(basename "$tpath")
+                            gid_file="/sys/class/infiniband/${hca_name}/ports/1/gids/${idx}"
+                            # Check for IPv4 GID (contains ffff:)
+                            if [ -f "$gid_file" ] && grep -q "ffff:" "$gid_file"; then
+                                gid_value=$(cat "$gid_file" 2>/dev/null || echo "")
+                                echo "[Infer RoCE] Found IPv4 RoCE v2 GID for ${hca_name}: index=${idx}, gid=${gid_value}"
+                                hca_gid_index["${hca_name}"]="${idx}"
+                                gid_index_count["${idx}"]=$((${gid_index_count["${idx}"]} + 1))
+                                break  # Use first found IPv4 GID per HCA
+                            fi
+                        fi
+                    done
+                done
+
+                # Find the most common GID index (most likely to be consistent across nodes)
+                best_gid_index=""
+                max_count=0
+                for idx in "${!gid_index_count[@]}"; do
+                    count=${gid_index_count["${idx}"]}
+                    echo "[Infer RoCE] GID_INDEX ${idx} found on ${count} HCAs"
+                    if [ $count -gt $max_count ]; then
+                        max_count=$count
+                        best_gid_index="$idx"
+                    fi
+                done
+
+                # Use deterministic fallback if counts are equal - prefer lower index number
+                if [ ${#gid_index_count[@]} -gt 1 ]; then
+                    echo "[Infer RoCE] Multiple GID indices found, selecting most common: ${best_gid_index}"
+                    # If there's a tie, prefer index 3 as it's most common in SR-IOV setups
+                    if [ -n "${gid_index_count['3']}" ] && [ "${gid_index_count['3']}" -eq "$max_count" ]; then
+                        best_gid_index="3"
+                        echo "[Infer RoCE] Using deterministic fallback: GID_INDEX=3 (SR-IOV standard)"
+                    fi
+                fi
+
+                # Check if GID_INDEX is already set via environment variables
+                if [ -n "${NCCL_IB_GID_INDEX}" ]; then
+                    echo "[Infer RoCE] Using pre-configured NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX} from environment"
+                    export NVSHMEM_IB_GID_INDEX=${NVSHMEM_IB_GID_INDEX:-$NCCL_IB_GID_INDEX}
+                    export UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-$NCCL_IB_GID_INDEX}
+                    echo "[Infer RoCE] Using hardcoded GID_INDEX=${NCCL_IB_GID_INDEX} for NCCL, NVSHMEM, and UCX"
+                elif [ -n "$best_gid_index" ]; then
+                    echo "[Infer RoCE] Selected GID_INDEX: ${best_gid_index} (found on ${max_count} HCAs)"
+
+                    export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-$best_gid_index}
+                    export NVSHMEM_IB_GID_INDEX=${NVSHMEM_IB_GID_INDEX:-$best_gid_index}
+                    export UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-$best_gid_index}
+
+                    echo "[Infer RoCE] Exported GID_INDEX=${best_gid_index} for NCCL, NVSHMEM, and UCX"
+                else
+                    echo "[Infer RoCE] ERROR: No valid IPv4 ${KSERVE_INFER_IB_GID_INDEX_GREP} GID_INDEX found on any HCA."
+                fi
+            else
+                echo "[Infer RoCE] No active HCAs found, skipping GID_INDEX inference."
+            fi
+          fi
+
+          # --disable-access-log-for-endpoints landed in vLLM 0.16.0 (vllm-project/vllm#30011).
+          # Older versions still need the blanket --disable-uvicorn-access-log.
+          ACCESS_LOG_ARGS="--disable-uvicorn-access-log"
+          VLLM_VERSION=$(vllm --version 2>/dev/null | tail -1 | awk '{print $NF}')
+          echo "[access-log-detect] vllm version='${VLLM_VERSION}'"
+          if [[ "$VLLM_VERSION" =~ ^[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "0.16.0" "${VLLM_VERSION}" | sort -V | head -1)" = "0.16.0" ]; then
+            ACCESS_LOG_ARGS="--disable-access-log-for-endpoints /health,/metrics,/ping"
+          fi
+          echo "[access-log-detect] selected ACCESS_LOG_ARGS='${ACCESS_LOG_ARGS}'"
+
+          eval "vllm serve /mnt/models \
+            --served-model-name "{{ .Spec.Model.Name }}" \
+            --port 8000 \
+            ${ACCESS_LOG_ARGS} \
+            {{ if .GlobalConfig.EnableTLS }}--enable-ssl-refresh{{- end }} \
+            {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt{{- end }} \
+            {{ if .GlobalConfig.EnableTLS }}--ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
+            ${VLLM_ADDITIONAL_ARGS} \
+            $@"
+        - --
+        env:
+        - name: HOME
+          value: /home
+        - name: VLLM_LOGGING_LEVEL
+          value: INFO
+        - name: HF_HUB_CACHE
+          value: /models
+        image: ghcr.io/llm-d/llm-d-cuda:v0.6.0
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+          periodSeconds: 10
+          timeoutSeconds: 10
+        name: main
+        ports:
+        - containerPort: 8000
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 60
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+          periodSeconds: 10
+          timeoutSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+        startupProbe:
+          failureThreshold: 60
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+          periodSeconds: 10
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /home
+          name: home
+        - mountPath: /tmp
+          name: tmp-dir
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /models
+          name: model-cache
+        - mountPath: /var/run/kserve/tls
+          name: tls-certs
+          readOnly: true
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir: {}
+        name: home
+      - emptyDir: {}
+        name: tmp-dir
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 1Gi
+        name: dshm
+      - emptyDir: {}
+        name: model-cache
+      - name: tls-certs
+        secret:
+          secretName: '{{ ChildName .ObjectMeta.Name `-kserve-self-signed-certs` }}'
+---
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceServiceConfig
+metadata:
+  name: kserve-config-llm-prefill-worker-data-parallel
+  namespace: kserve
+spec:
+  prefill:
+    template:
+      containers:
+      - command:
+        - /bin/bash
+        - -c
+        - |-
+          # In some versions, ZMQ bind doesn't resolve the address through DNS
+          # Retry DP_ADDRESS resolution (configurable attempts, default 30)
+          RESOLVE_ATTEMPTS=${DP_ADDRESS_RESOLVE_ATTEMPTS:-30}
+          for ((i=1; i<=RESOLVE_ATTEMPTS; i++)); do
+            DP_ADDRESS=$(getent hosts ${LWS_LEADER_ADDRESS} | cut -d' ' -f1)
+            if [ -n "$DP_ADDRESS" ]; then
+              echo "DP_ADDRESS=${DP_ADDRESS} (resolved on attempt $i)"
+              break
+            else
+              echo "DP_ADDRESS resolution failed on attempt $i, retrying..."
+              sleep 1
+            fi
+          done
+
+          if [ -z "$DP_ADDRESS" ]; then
+            echo "WARNING: Failed to resolve DP_ADDRESS after ${RESOLVE_ATTEMPTS} attempts, falling back to LWS_LEADER_ADDRESS"
+            DP_ADDRESS=${LWS_LEADER_ADDRESS}
+            echo "DP_ADDRESS=${DP_ADDRESS} (fallback)"
+          fi
+
+          if [ "$KSERVE_INFER_ROCE" = "true" ]; then
+            echo "Trying to infer RoCE configs ... "
+            grep -H . /sys/class/infiniband/*/ports/*/gids/* 2>/dev/null
+            grep -H . /sys/class/infiniband/*/ports/*/gid_attrs/types/* 2>/dev/null
+
+            cat /proc/driver/nvidia/params
+
+            KSERVE_INFER_IB_GID_INDEX_GREP=${KSERVE_INFER_IB_GID_INDEX_GREP:-"RoCE v2"}
+
+            echo "[Infer RoCE] Discovering active HCAs ..."
+            active_hcas=()
+            # Loop through all mlx5 devices found in sysfs
+            for hca_dir in /sys/class/infiniband/mlx5_*; do
+                # Ensure it's a directory before proceeding
+                if [ -d "$hca_dir" ]; then
+                    hca_name=$(basename "$hca_dir")
+                    port_state_file="$hca_dir/ports/1/state" # Assume port 1
+                    type_file="$hca_dir/ports/1/gid_attrs/types/*"
+
+                    echo "[Infer RoCE] Check if the port state file ${port_state_file} exists and contains 'ACTIVE'"
+                    if [ -f "$port_state_file" ] && grep -q "ACTIVE" "$port_state_file" && grep -q "${KSERVE_INFER_IB_GID_INDEX_GREP}" ${type_file} 2>/dev/null; then
+                        echo "[Infer RoCE] Found active HCA: $hca_name"
+                        active_hcas+=("$hca_name")
+                    else
+                        echo "[Infer RoCE] Skipping inactive or down HCA: $hca_name"
+                    fi
+                fi
+            done
+
+            ucx_hcas=()
+            for hca in "${active_hcas[@]}"; do
+              ucx_hcas+=("${hca}:1")
+            done
+
+            # Check if we found any active HCAs
+            if [ ${#active_hcas[@]} -gt 0 ]; then
+                # Join the array elements with a comma
+                hcas=$(IFS=,; echo "${active_hcas[*]}")
+                echo "[Infer RoCE] Setting active HCAs: ${hcas}"
+                export NCCL_IB_HCA=${NCCL_IB_HCA:-${hcas}}
+                export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${ucx_hcas}}
                 export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${ucx_hcas}}
 
                 echo "[Infer RoCE] NCCL_IB_HCA=${NCCL_IB_HCA}"
@@ -3232,6 +3625,17 @@ spec:
           fi
 
           START_RANK=0
+
+          # --disable-access-log-for-endpoints landed in vLLM 0.16.0 (vllm-project/vllm#30011).
+          # Older versions still need the blanket --disable-uvicorn-access-log.
+          ACCESS_LOG_ARGS="--disable-uvicorn-access-log"
+          VLLM_VERSION=$(vllm --version 2>/dev/null | tail -1 | awk '{print $NF}')
+          echo "[access-log-detect] vllm version='${VLLM_VERSION}'"
+          if [[ "$VLLM_VERSION" =~ ^[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "0.16.0" "${VLLM_VERSION}" | sort -V | head -1)" = "0.16.0" ]; then
+            ACCESS_LOG_ARGS="--disable-access-log-for-endpoints /health,/metrics,/ping"
+          fi
+          echo "[access-log-detect] selected ACCESS_LOG_ARGS='${ACCESS_LOG_ARGS}'"
+
           eval "vllm serve \
             /mnt/models \
             --served-model-name "{{ .Spec.Model.Name }}" \
@@ -3244,15 +3648,12 @@ spec:
             --data-parallel-address ${DP_ADDRESS} \
             --data-parallel-rpc-port {{ if .Spec.Prefill.Parallelism.DataRPCPort }}{{ .Spec.Prefill.Parallelism.DataRPCPort }}{{ else }}5555{{- end }} \
             --data-parallel-start-rank $START_RANK \
+            ${ACCESS_LOG_ARGS} \
+            {{ if .GlobalConfig.EnableTLS }}--enable-ssl-refresh{{- end }} \
+            {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt{{- end }} \
+            {{ if .GlobalConfig.EnableTLS }}--ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
             ${VLLM_ADDITIONAL_ARGS} \
-            $@ \
-            --trust-remote-code"
-            # BackendTLSPolicy is not implemented yet so disable SSL for now
-            # --enable-ssl-refresh \
-            # --ssl-certfile \
-            # /var/run/kserve/tls/tls.crt \
-            # --ssl-keyfile \
-            # /var/run/kserve/tls/tls.key"
+            $@"
         - --
         env:
         - name: HOME
@@ -3261,14 +3662,14 @@ spec:
           value: INFO
         - name: HF_HUB_CACHE
           value: /models
-        image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+        image: ghcr.io/llm-d/llm-d-cuda:v0.6.0
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 3
           httpGet:
             path: /health
             port: 8000
-            scheme: HTTP
+            scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
           periodSeconds: 10
           timeoutSeconds: 10
         name: main
@@ -3280,7 +3681,7 @@ spec:
           httpGet:
             path: /health
             port: 8000
-            scheme: HTTP
+            scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
           periodSeconds: 30
           timeoutSeconds: 5
         securityContext:
@@ -3292,8 +3693,8 @@ spec:
             - NET_RAW
             drop:
             - ALL
-          readOnlyRootFilesystem: false
-          runAsNonRoot: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
           seccompProfile:
             type: RuntimeDefault
         startupProbe:
@@ -3301,13 +3702,15 @@ spec:
           httpGet:
             path: /health
             port: 8000
-            scheme: HTTP
+            scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
           periodSeconds: 10
         terminationMessagePath: /dev/termination-log
         terminationMessagePolicy: FallbackToLogsOnError
         volumeMounts:
         - mountPath: /home
           name: home
+        - mountPath: /tmp
+          name: tmp-dir
         - mountPath: /dev/shm
           name: dshm
         - mountPath: /models
@@ -3319,6 +3722,8 @@ spec:
       volumes:
       - emptyDir: {}
         name: home
+      - emptyDir: {}
+        name: tmp-dir
       - emptyDir:
           medium: Memory
           sizeLimit: 8Gi
@@ -3335,17 +3740,31 @@ spec:
         - -c
         - |-
           # In some versions, ZMQ bind doesn't resolve the address through DNS
-          DP_ADDRESS=$(getent hosts "${LWS_LEADER_ADDRESS}" | cut -d' ' -f1)
-          if [ -z "${DP_ADDRESS}" ]; then
-            echo "ERROR: Failed to resolve LWS_LEADER_ADDRESS='${LWS_LEADER_ADDRESS}'" >&2
-            exit 1
+          # Retry DP_ADDRESS resolution (configurable attempts, default 30)
+          RESOLVE_ATTEMPTS=${DP_ADDRESS_RESOLVE_ATTEMPTS:-30}
+          for ((i=1; i<=RESOLVE_ATTEMPTS; i++)); do
+            DP_ADDRESS=$(getent hosts ${LWS_LEADER_ADDRESS} | cut -d' ' -f1)
+            if [ -n "$DP_ADDRESS" ]; then
+              echo "DP_ADDRESS=${DP_ADDRESS} (resolved on attempt $i)"
+              break
+            else
+              echo "DP_ADDRESS resolution failed on attempt $i, retrying..."
+              sleep 1
+            fi
+          done
+
+          if [ -z "$DP_ADDRESS" ]; then
+            echo "WARNING: Failed to resolve DP_ADDRESS after ${RESOLVE_ATTEMPTS} attempts, falling back to LWS_LEADER_ADDRESS"
+            DP_ADDRESS=${LWS_LEADER_ADDRESS}
+            echo "DP_ADDRESS=${DP_ADDRESS} (fallback)"
           fi
-          echo "DP_ADDRESS=${DP_ADDRESS}"
 
           if [ "$KSERVE_INFER_ROCE" = "true" ]; then
             echo "Trying to infer RoCE configs ... "
             grep -H . /sys/class/infiniband/*/ports/*/gids/* 2>/dev/null
             grep -H . /sys/class/infiniband/*/ports/*/gid_attrs/types/* 2>/dev/null
+
+            cat /proc/driver/nvidia/params
 
             KSERVE_INFER_IB_GID_INDEX_GREP=${KSERVE_INFER_IB_GID_INDEX_GREP:-"RoCE v2"}
 
@@ -3380,7 +3799,7 @@ spec:
                 hcas=$(IFS=,; echo "${active_hcas[*]}")
                 echo "[Infer RoCE] Setting active HCAs: ${hcas}"
                 export NCCL_IB_HCA=${NCCL_IB_HCA:-${hcas}}
-                export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${hcas}}
+                export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${ucx_hcas}}
                 export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${ucx_hcas}}
 
                 echo "[Infer RoCE] NCCL_IB_HCA=${NCCL_IB_HCA}"
@@ -3461,6 +3880,17 @@ spec:
           fi
 
           START_RANK=$(( ${LWS_WORKER_INDEX:-0} * {{ or .Spec.Prefill.Parallelism.DataLocal 1 }} ))
+
+          # --disable-access-log-for-endpoints landed in vLLM 0.16.0 (vllm-project/vllm#30011).
+          # Older versions still need the blanket --disable-uvicorn-access-log.
+          ACCESS_LOG_ARGS="--disable-uvicorn-access-log"
+          VLLM_VERSION=$(vllm --version 2>/dev/null | tail -1 | awk '{print $NF}')
+          echo "[access-log-detect] vllm version='${VLLM_VERSION}'"
+          if [[ "$VLLM_VERSION" =~ ^[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "0.16.0" "${VLLM_VERSION}" | sort -V | head -1)" = "0.16.0" ]; then
+            ACCESS_LOG_ARGS="--disable-access-log-for-endpoints /health,/metrics,/ping"
+          fi
+          echo "[access-log-detect] selected ACCESS_LOG_ARGS='${ACCESS_LOG_ARGS}'"
+
           eval "vllm serve \
             /mnt/models \
             --served-model-name "{{ .Spec.Model.Name }}" \
@@ -3472,16 +3902,13 @@ spec:
             --data-parallel-address ${DP_ADDRESS} \
             --data-parallel-rpc-port {{ if .Spec.Prefill.Parallelism.DataRPCPort }}{{ .Spec.Prefill.Parallelism.DataRPCPort }}{{ else }}5555{{- end }} \
             --data-parallel-start-rank $START_RANK \
+            --headless \
+            ${ACCESS_LOG_ARGS} \
+            {{ if .GlobalConfig.EnableTLS }}--enable-ssl-refresh{{- end }} \
+            {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt{{- end }} \
+            {{ if .GlobalConfig.EnableTLS }}--ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
             ${VLLM_ADDITIONAL_ARGS} \
-            $@ \
-            --trust-remote-code \
-            --headless"
-            # BackendTLSPolicy is not implemented yet so disable SSL for now
-            # --enable-ssl-refresh \
-            # --ssl-certfile \
-            # /var/run/kserve/tls/tls.crt \
-            # --ssl-keyfile \
-            # /var/run/kserve/tls/tls.key"
+            $@"
         - --
         env:
         - name: HOME
@@ -3490,7 +3917,7 @@ spec:
           value: INFO
         - name: HF_HUB_CACHE
           value: /models
-        image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+        image: ghcr.io/llm-d/llm-d-cuda:v0.6.0
         imagePullPolicy: IfNotPresent
         name: main
         ports:
@@ -3505,8 +3932,8 @@ spec:
             - NET_RAW
             drop:
             - ALL
-          readOnlyRootFilesystem: false
-          runAsNonRoot: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
           seccompProfile:
             type: RuntimeDefault
         terminationMessagePath: /dev/termination-log
@@ -3514,6 +3941,8 @@ spec:
         volumeMounts:
         - mountPath: /home
           name: home
+        - mountPath: /tmp
+          name: tmp-dir
         - mountPath: /dev/shm
           name: dshm
         - mountPath: /models
@@ -3525,6 +3954,8 @@ spec:
       volumes:
       - emptyDir: {}
         name: home
+      - emptyDir: {}
+        name: tmp-dir
       - emptyDir:
           medium: Memory
           sizeLimit: 8Gi
@@ -3590,6 +4021,25 @@ spec:
               backendRequest: 0s
               request: 0s
           - backendRefs:
+            - group: inference.networking.k8s.io
+              kind: InferencePool
+              name: '{{ ChildName .ObjectMeta.Name `-inference-pool` }}'
+              port: 8000
+              weight: 1
+            filters:
+            - type: URLRewrite
+              urlRewrite:
+                path:
+                  replacePrefixMatch: /v1/responses
+                  type: ReplacePrefixMatch
+            matches:
+            - path:
+                type: PathPrefix
+                value: /{{ .ObjectMeta.Namespace }}/{{ .ObjectMeta.Name }}/v1/responses
+            timeouts:
+              backendRequest: 0s
+              request: 0s
+          - backendRefs:
             - kind: Service
               name: '{{ ChildName .ObjectMeta.Name `-kserve-workload-svc` }}'
               port: 8000
@@ -3616,6 +4066,8 @@ metadata:
 spec:
   router:
     scheduler:
+      annotations:
+        app.kubernetes.io/version: 0.7.0
       pool:
         spec:
           endpointPickerRef:
@@ -3633,7 +4085,8 @@ spec:
           - number: 8000
       template:
         containers:
-        - args:
+        - command:
+          - /app/epp
           - --pool-name
           - '{{ ChildName .ObjectMeta.Name `-inference-pool` }}'
           - --pool-namespace
@@ -3644,9 +4097,16 @@ spec:
           - "9002"
           - --grpc-health-port
           - "9003"
-          - --kv-cache-usage-percentage-metric
-          - vllm:kv_cache_usage_perc
-          image: ghcr.io/llm-d/llm-d-inference-scheduler:v0.4.0
+          - '{{ if .GlobalConfig.EnableTLS }}--enable-cert-reload=true{{- end }}'
+          - '{{ if .GlobalConfig.EnableTLS }}--secure-serving=true{{- end }}'
+          - '{{ if .GlobalConfig.EnableTLS }}--model-server-metrics-scheme=https{{-
+            end }}'
+          - '{{ if .GlobalConfig.EnableTLS }}--cert-path=/var/run/kserve/tls{{- end
+            }}'
+          env:
+          - name: SSL_CERT_DIR
+            value: /var/run/kserve/tls:/var/run/secrets/kubernetes.io/serviceaccount:/etc/pki/tls/certs
+          image: ghcr.io/llm-d/llm-d-inference-scheduler:v0.7.1
           imagePullPolicy: IfNotPresent
           livenessProbe:
             failureThreshold: 3
@@ -3699,6 +4159,63 @@ spec:
           - mountPath: /var/run/kserve/tls
             name: tls-certs
             readOnly: true
+          - mountPath: /tmp/tokenizer
+            name: tokenizer-uds
+        - env:
+          - name: TOKENIZERS_DIR
+            value: /mnt/models
+          image: ghcr.io/llm-d/llm-d-uds-tokenizer:v0.7.1
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 8082
+            periodSeconds: 15
+            timeoutSeconds: 5
+          name: tokenizer
+          ports:
+          - containerPort: 8082
+            name: health
+            protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 8082
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 256m
+              memory: 500Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          startupProbe:
+            failureThreshold: 60
+            httpGet:
+              path: /healthz
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: FallbackToLogsOnError
+          volumeMounts:
+          - mountPath: /tmp
+            name: tokenizer-tmp
+          - mountPath: /.cache
+            name: tokenizer-cache
+          - mountPath: /tmp/tokenizer
+            name: tokenizer-uds
+          workingDir: /mnt/models
         dnsPolicy: ClusterFirst
         restartPolicy: Always
         terminationGracePeriodSeconds: 30
@@ -3707,6 +4224,12 @@ spec:
           secret:
             secretName: '{{ ChildName .ObjectMeta.Name `-kserve-self-signed-certs`
               }}'
+        - emptyDir: {}
+          name: tokenizer-uds
+        - emptyDir: {}
+          name: tokenizer-tmp
+        - emptyDir: {}
+          name: tokenizer-cache
 ---
 apiVersion: serving.kserve.io/v1alpha2
 kind: LLMInferenceServiceConfig
@@ -3717,108 +4240,15 @@ spec:
   template:
     containers:
     - command:
-      - vllm
-      - serve
-      - /mnt/models
-      - --served-model-name
-      - '{{ .Spec.Model.Name }}'
-      - --port
-      - "8000"
-      env:
-      - name: HOME
-        value: /home
-      - name: VLLM_LOGGING_LEVEL
-        value: INFO
-      - name: HF_HUB_CACHE
-        value: /models
-      image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
-      imagePullPolicy: IfNotPresent
-      livenessProbe:
-        failureThreshold: 3
-        httpGet:
-          path: /health
-          port: 8000
-          scheme: HTTP
-        periodSeconds: 10
-        timeoutSeconds: 10
-      name: main
-      ports:
-      - containerPort: 8000
-        protocol: TCP
-      readinessProbe:
-        failureThreshold: 60
-        httpGet:
-          path: /health
-          port: 8000
-          scheme: HTTP
-        periodSeconds: 10
-        timeoutSeconds: 5
-      securityContext:
-        allowPrivilegeEscalation: false
-        capabilities:
-          drop:
-          - ALL
-        readOnlyRootFilesystem: false
-        runAsNonRoot: false
-        seccompProfile:
-          type: RuntimeDefault
-      startupProbe:
-        failureThreshold: 60
-        httpGet:
-          path: /health
-          port: 8000
-          scheme: HTTP
-        periodSeconds: 10
-      terminationMessagePath: /dev/termination-log
-      terminationMessagePolicy: FallbackToLogsOnError
-      volumeMounts:
-      - mountPath: /home
-        name: home
-      - mountPath: /dev/shm
-        name: dshm
-      - mountPath: /models
-        name: model-cache
-      - mountPath: /var/run/kserve/tls
-        name: tls-certs
-        readOnly: true
-    terminationGracePeriodSeconds: 30
-    volumes:
-    - emptyDir: {}
-      name: home
-    - emptyDir:
-        medium: Memory
-        sizeLimit: 1Gi
-      name: dshm
-    - emptyDir: {}
-      name: model-cache
-    - name: tls-certs
-      secret:
-        secretName: '{{ ChildName .ObjectMeta.Name `-kserve-self-signed-certs` }}'
----
-apiVersion: serving.kserve.io/v1alpha2
-kind: LLMInferenceServiceConfig
-metadata:
-  name: kserve-config-llm-worker-data-parallel
-  namespace: kserve
-spec:
-  template:
-    containers:
-    - command:
       - /bin/bash
       - -c
       - |-
-        # In some versions, ZMQ bind doesn't resolve the address through DNS
-        DP_ADDRESS=$(getent hosts "${LWS_LEADER_ADDRESS}" | cut -d' ' -f1)
-        if [ -z "${DP_ADDRESS}" ]; then
-          echo "ERROR: Failed to resolve LWS_LEADER_ADDRESS='${LWS_LEADER_ADDRESS}'" >&2
-          exit 1
-        fi
-        echo "DP_ADDRESS=${DP_ADDRESS}"
-
         if [ "$KSERVE_INFER_ROCE" = "true" ]; then
           echo "Trying to infer RoCE configs ... "
           grep -H . /sys/class/infiniband/*/ports/*/gids/* 2>/dev/null
           grep -H . /sys/class/infiniband/*/ports/*/gid_attrs/types/* 2>/dev/null
+
+          cat /proc/driver/nvidia/params
 
           KSERVE_INFER_IB_GID_INDEX_GREP=${KSERVE_INFER_IB_GID_INDEX_GREP:-"RoCE v2"}
 
@@ -3853,7 +4283,254 @@ spec:
               hcas=$(IFS=,; echo "${active_hcas[*]}")
               echo "[Infer RoCE] Setting active HCAs: ${hcas}"
               export NCCL_IB_HCA=${NCCL_IB_HCA:-${hcas}}
-              export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${hcas}}
+              export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${ucx_hcas}}
+              export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${ucx_hcas}}
+
+              echo "[Infer RoCE] NCCL_IB_HCA=${NCCL_IB_HCA}"
+              echo "[Infer RoCE] NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST}"
+          else
+              echo "[Infer RoCE] WARNING: No active RoCE HCAs found. NCCL_IB_HCA will not be set."
+          fi
+
+          if [ ${#active_hcas[@]} -gt 0 ]; then
+              echo "[Infer RoCE] Finding GID_INDEX for each active HCA (SR-IOV compatible)..."
+
+              # For SR-IOV environments, find the most common IPv4 RoCE v2 GID index across all HCAs
+              declare -A gid_index_count
+              declare -A hca_gid_index
+
+              for hca_name in "${active_hcas[@]}"; do
+                  echo "[Infer RoCE] Processing HCA: ${hca_name}"
+
+                  # Find all RoCE v2 IPv4 GIDs for this HCA and count by index
+                  for tpath in /sys/class/infiniband/${hca_name}/ports/1/gid_attrs/types/*; do
+                      if grep -q "${KSERVE_INFER_IB_GID_INDEX_GREP}" "$tpath" 2>/dev/null; then
+                          idx=$(basename "$tpath")
+                          gid_file="/sys/class/infiniband/${hca_name}/ports/1/gids/${idx}"
+                          # Check for IPv4 GID (contains ffff:)
+                          if [ -f "$gid_file" ] && grep -q "ffff:" "$gid_file"; then
+                              gid_value=$(cat "$gid_file" 2>/dev/null || echo "")
+                              echo "[Infer RoCE] Found IPv4 RoCE v2 GID for ${hca_name}: index=${idx}, gid=${gid_value}"
+                              hca_gid_index["${hca_name}"]="${idx}"
+                              gid_index_count["${idx}"]=$((${gid_index_count["${idx}"]} + 1))
+                              break  # Use first found IPv4 GID per HCA
+                          fi
+                      fi
+                  done
+              done
+
+              # Find the most common GID index (most likely to be consistent across nodes)
+              best_gid_index=""
+              max_count=0
+              for idx in "${!gid_index_count[@]}"; do
+                  count=${gid_index_count["${idx}"]}
+                  echo "[Infer RoCE] GID_INDEX ${idx} found on ${count} HCAs"
+                  if [ $count -gt $max_count ]; then
+                      max_count=$count
+                      best_gid_index="$idx"
+                  fi
+              done
+
+              # Use deterministic fallback if counts are equal - prefer lower index number
+              if [ ${#gid_index_count[@]} -gt 1 ]; then
+                  echo "[Infer RoCE] Multiple GID indices found, selecting most common: ${best_gid_index}"
+                  # If there's a tie, prefer index 3 as it's most common in SR-IOV setups
+                  if [ -n "${gid_index_count['3']}" ] && [ "${gid_index_count['3']}" -eq "$max_count" ]; then
+                      best_gid_index="3"
+                      echo "[Infer RoCE] Using deterministic fallback: GID_INDEX=3 (SR-IOV standard)"
+                  fi
+              fi
+
+              # Check if GID_INDEX is already set via environment variables
+              if [ -n "${NCCL_IB_GID_INDEX}" ]; then
+                  echo "[Infer RoCE] Using pre-configured NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX} from environment"
+                  export NVSHMEM_IB_GID_INDEX=${NVSHMEM_IB_GID_INDEX:-$NCCL_IB_GID_INDEX}
+                  export UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-$NCCL_IB_GID_INDEX}
+                  echo "[Infer RoCE] Using hardcoded GID_INDEX=${NCCL_IB_GID_INDEX} for NCCL, NVSHMEM, and UCX"
+              elif [ -n "$best_gid_index" ]; then
+                  echo "[Infer RoCE] Selected GID_INDEX: ${best_gid_index} (found on ${max_count} HCAs)"
+
+                  export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-$best_gid_index}
+                  export NVSHMEM_IB_GID_INDEX=${NVSHMEM_IB_GID_INDEX:-$best_gid_index}
+                  export UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-$best_gid_index}
+
+                  echo "[Infer RoCE] Exported GID_INDEX=${best_gid_index} for NCCL, NVSHMEM, and UCX"
+              else
+                  echo "[Infer RoCE] ERROR: No valid IPv4 ${KSERVE_INFER_IB_GID_INDEX_GREP} GID_INDEX found on any HCA."
+              fi
+          else
+              echo "[Infer RoCE] No active HCAs found, skipping GID_INDEX inference."
+          fi
+        fi
+
+        # --disable-access-log-for-endpoints landed in vLLM 0.16.0 (vllm-project/vllm#30011).
+        # Older versions still need the blanket --disable-uvicorn-access-log.
+        ACCESS_LOG_ARGS="--disable-uvicorn-access-log"
+        VLLM_VERSION=$(vllm --version 2>/dev/null | tail -1 | awk '{print $NF}')
+        echo "[access-log-detect] vllm version='${VLLM_VERSION}'"
+        if [[ "$VLLM_VERSION" =~ ^[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "0.16.0" "${VLLM_VERSION}" | sort -V | head -1)" = "0.16.0" ]; then
+          ACCESS_LOG_ARGS="--disable-access-log-for-endpoints /health,/metrics,/ping"
+        fi
+        echo "[access-log-detect] selected ACCESS_LOG_ARGS='${ACCESS_LOG_ARGS}'"
+
+        eval "vllm serve /mnt/models \
+          --served-model-name "{{ .Spec.Model.Name }}" \
+          --port 8000 \
+          ${ACCESS_LOG_ARGS} \
+          {{ if .GlobalConfig.EnableTLS }}--enable-ssl-refresh{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
+          ${VLLM_ADDITIONAL_ARGS} \
+          $@"
+      - --
+      env:
+      - name: HOME
+        value: /home
+      - name: VLLM_LOGGING_LEVEL
+        value: INFO
+      - name: HF_HUB_CACHE
+        value: /models
+      image: ghcr.io/llm-d/llm-d-cuda:v0.6.0
+      imagePullPolicy: IfNotPresent
+      livenessProbe:
+        failureThreshold: 3
+        httpGet:
+          path: /health
+          port: 8000
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+        periodSeconds: 10
+        timeoutSeconds: 10
+      name: main
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      readinessProbe:
+        failureThreshold: 60
+        httpGet:
+          path: /health
+          port: 8000
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+        periodSeconds: 10
+        timeoutSeconds: 5
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+          - ALL
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      startupProbe:
+        failureThreshold: 60
+        httpGet:
+          path: /health
+          port: 8000
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
+        periodSeconds: 10
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: FallbackToLogsOnError
+      volumeMounts:
+      - mountPath: /home
+        name: home
+      - mountPath: /tmp
+        name: tmp-dir
+      - mountPath: /dev/shm
+        name: dshm
+      - mountPath: /models
+        name: model-cache
+      - mountPath: /var/run/kserve/tls
+        name: tls-certs
+        readOnly: true
+    terminationGracePeriodSeconds: 30
+    volumes:
+    - emptyDir: {}
+      name: home
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 1Gi
+      name: dshm
+    - emptyDir: {}
+      name: model-cache
+    - emptyDir: {}
+      name: tmp-dir
+    - name: tls-certs
+      secret:
+        secretName: '{{ ChildName .ObjectMeta.Name `-kserve-self-signed-certs` }}'
+---
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceServiceConfig
+metadata:
+  name: kserve-config-llm-worker-data-parallel
+  namespace: kserve
+spec:
+  template:
+    containers:
+    - command:
+      - /bin/bash
+      - -c
+      - |-
+        # In some versions, ZMQ bind doesn't resolve the address through DNS
+        # Retry DP_ADDRESS resolution (configurable attempts, default 30)
+        RESOLVE_ATTEMPTS=${DP_ADDRESS_RESOLVE_ATTEMPTS:-30}
+        for ((i=1; i<=RESOLVE_ATTEMPTS; i++)); do
+          DP_ADDRESS=$(getent hosts ${LWS_LEADER_ADDRESS} | cut -d' ' -f1)
+          if [ -n "$DP_ADDRESS" ]; then
+            echo "DP_ADDRESS=${DP_ADDRESS} (resolved on attempt $i)"
+            break
+          else
+            echo "DP_ADDRESS resolution failed on attempt $i, retrying..."
+            sleep 1
+          fi
+        done
+
+        if [ -z "$DP_ADDRESS" ]; then
+          echo "WARNING: Failed to resolve DP_ADDRESS after ${RESOLVE_ATTEMPTS} attempts, falling back to LWS_LEADER_ADDRESS"
+          DP_ADDRESS=${LWS_LEADER_ADDRESS}
+          echo "DP_ADDRESS=${DP_ADDRESS} (fallback)"
+        fi
+
+        if [ "$KSERVE_INFER_ROCE" = "true" ]; then
+          echo "Trying to infer RoCE configs ... "
+          grep -H . /sys/class/infiniband/*/ports/*/gids/* 2>/dev/null
+          grep -H . /sys/class/infiniband/*/ports/*/gid_attrs/types/* 2>/dev/null
+
+          cat /proc/driver/nvidia/params
+
+          KSERVE_INFER_IB_GID_INDEX_GREP=${KSERVE_INFER_IB_GID_INDEX_GREP:-"RoCE v2"}
+
+          echo "[Infer RoCE] Discovering active HCAs ..."
+          active_hcas=()
+          # Loop through all mlx5 devices found in sysfs
+          for hca_dir in /sys/class/infiniband/mlx5_*; do
+              # Ensure it's a directory before proceeding
+              if [ -d "$hca_dir" ]; then
+                  hca_name=$(basename "$hca_dir")
+                  port_state_file="$hca_dir/ports/1/state" # Assume port 1
+                  type_file="$hca_dir/ports/1/gid_attrs/types/*"
+
+                  echo "[Infer RoCE] Check if the port state file ${port_state_file} exists and contains 'ACTIVE'"
+                  if [ -f "$port_state_file" ] && grep -q "ACTIVE" "$port_state_file" && grep -q "${KSERVE_INFER_IB_GID_INDEX_GREP}" ${type_file} 2>/dev/null; then
+                      echo "[Infer RoCE] Found active HCA: $hca_name"
+                      active_hcas+=("$hca_name")
+                  else
+                      echo "[Infer RoCE] Skipping inactive or down HCA: $hca_name"
+                  fi
+              fi
+          done
+
+          ucx_hcas=()
+          for hca in "${active_hcas[@]}"; do
+            ucx_hcas+=("${hca}:1")
+          done
+
+          # Check if we found any active HCAs
+          if [ ${#active_hcas[@]} -gt 0 ]; then
+              # Join the array elements with a comma
+              hcas=$(IFS=,; echo "${active_hcas[*]}")
+              echo "[Infer RoCE] Setting active HCAs: ${hcas}"
+              export NCCL_IB_HCA=${NCCL_IB_HCA:-${hcas}}
+              export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${ucx_hcas}}
               export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${ucx_hcas}}
 
               echo "[Infer RoCE] NCCL_IB_HCA=${NCCL_IB_HCA}"
@@ -3934,6 +4611,17 @@ spec:
         fi
 
         START_RANK=0
+
+        # --disable-access-log-for-endpoints landed in vLLM 0.16.0 (vllm-project/vllm#30011).
+        # Older versions still need the blanket --disable-uvicorn-access-log.
+        ACCESS_LOG_ARGS="--disable-uvicorn-access-log"
+        VLLM_VERSION=$(vllm --version 2>/dev/null | tail -1 | awk '{print $NF}')
+        echo "[access-log-detect] vllm version='${VLLM_VERSION}'"
+        if [[ "$VLLM_VERSION" =~ ^[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "0.16.0" "${VLLM_VERSION}" | sort -V | head -1)" = "0.16.0" ]; then
+          ACCESS_LOG_ARGS="--disable-access-log-for-endpoints /health,/metrics,/ping"
+        fi
+        echo "[access-log-detect] selected ACCESS_LOG_ARGS='${ACCESS_LOG_ARGS}'"
+
         eval "vllm serve \
           /mnt/models \
           --served-model-name "{{ .Spec.Model.Name }}" \
@@ -3946,15 +4634,12 @@ spec:
           --data-parallel-address ${DP_ADDRESS} \
           --data-parallel-rpc-port {{ if .Spec.Parallelism.DataRPCPort }}{{ .Spec.Parallelism.DataRPCPort }}{{ else }}5555{{- end }} \
           --data-parallel-start-rank $START_RANK \
+          ${ACCESS_LOG_ARGS} \
+          {{ if .GlobalConfig.EnableTLS }}--enable-ssl-refresh{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
           ${VLLM_ADDITIONAL_ARGS} \
-          $@ \
-          --trust-remote-code"
-          # BackendTLSPolicy is not implemented yet so disable SSL for now
-          # --enable-ssl-refresh \
-          # --ssl-certfile \
-          # /var/run/kserve/tls/tls.crt \
-          # --ssl-keyfile \
-          # /var/run/kserve/tls/tls.key"
+          $@"
       - --
       env:
       - name: HOME
@@ -3963,14 +4648,14 @@ spec:
         value: INFO
       - name: HF_HUB_CACHE
         value: /models
-      image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+      image: ghcr.io/llm-d/llm-d-cuda:v0.6.0
       imagePullPolicy: IfNotPresent
       livenessProbe:
         failureThreshold: 3
         httpGet:
           path: /health
           port: 8000
-          scheme: HTTP
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
         periodSeconds: 10
         timeoutSeconds: 10
       name: main
@@ -3982,7 +4667,7 @@ spec:
         httpGet:
           path: /health
           port: 8000
-          scheme: HTTP
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
         periodSeconds: 30
         timeoutSeconds: 5
       securityContext:
@@ -3994,8 +4679,8 @@ spec:
           - NET_RAW
           drop:
           - ALL
-        readOnlyRootFilesystem: false
-        runAsNonRoot: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       startupProbe:
@@ -4003,13 +4688,15 @@ spec:
         httpGet:
           path: /health
           port: 8000
-          scheme: HTTP
+          scheme: '{{ if .GlobalConfig.EnableTLS }}HTTPS{{else}}HTTP{{- end }}'
         periodSeconds: 10
       terminationMessagePath: /dev/termination-log
       terminationMessagePolicy: FallbackToLogsOnError
       volumeMounts:
       - mountPath: /home
         name: home
+      - mountPath: /tmp
+        name: tmp-dir
       - mountPath: /dev/shm
         name: dshm
       - mountPath: /models
@@ -4021,6 +4708,8 @@ spec:
     volumes:
     - emptyDir: {}
       name: home
+    - emptyDir: {}
+      name: tmp-dir
     - emptyDir:
         medium: Memory
         sizeLimit: 8Gi
@@ -4037,17 +4726,31 @@ spec:
       - -c
       - |-
         # In some versions, ZMQ bind doesn't resolve the address through DNS
-        DP_ADDRESS=$(getent hosts "${LWS_LEADER_ADDRESS}" | cut -d' ' -f1)
-        if [ -z "${DP_ADDRESS}" ]; then
-          echo "ERROR: Failed to resolve LWS_LEADER_ADDRESS='${LWS_LEADER_ADDRESS}'" >&2
-          exit 1
+        # Retry DP_ADDRESS resolution (configurable attempts, default 30)
+        RESOLVE_ATTEMPTS=${DP_ADDRESS_RESOLVE_ATTEMPTS:-30}
+        for ((i=1; i<=RESOLVE_ATTEMPTS; i++)); do
+          DP_ADDRESS=$(getent hosts ${LWS_LEADER_ADDRESS} | cut -d' ' -f1)
+          if [ -n "$DP_ADDRESS" ]; then
+            echo "DP_ADDRESS=${DP_ADDRESS} (resolved on attempt $i)"
+            break
+          else
+            echo "DP_ADDRESS resolution failed on attempt $i, retrying..."
+            sleep 1
+          fi
+        done
+
+        if [ -z "$DP_ADDRESS" ]; then
+          echo "WARNING: Failed to resolve DP_ADDRESS after ${RESOLVE_ATTEMPTS} attempts, falling back to LWS_LEADER_ADDRESS"
+          DP_ADDRESS=${LWS_LEADER_ADDRESS}
+          echo "DP_ADDRESS=${DP_ADDRESS} (fallback)"
         fi
-        echo "DP_ADDRESS=${DP_ADDRESS}"
 
         if [ "$KSERVE_INFER_ROCE" = "true" ]; then
           echo "Trying to infer RoCE configs ... "
           grep -H . /sys/class/infiniband/*/ports/*/gids/* 2>/dev/null
           grep -H . /sys/class/infiniband/*/ports/*/gid_attrs/types/* 2>/dev/null
+
+          cat /proc/driver/nvidia/params
 
           KSERVE_INFER_IB_GID_INDEX_GREP=${KSERVE_INFER_IB_GID_INDEX_GREP:-"RoCE v2"}
 
@@ -4082,7 +4785,7 @@ spec:
               hcas=$(IFS=,; echo "${active_hcas[*]}")
               echo "[Infer RoCE] Setting active HCAs: ${hcas}"
               export NCCL_IB_HCA=${NCCL_IB_HCA:-${hcas}}
-              export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${hcas}}
+              export NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST:-${ucx_hcas}}
               export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${ucx_hcas}}
 
               echo "[Infer RoCE] NCCL_IB_HCA=${NCCL_IB_HCA}"
@@ -4163,6 +4866,17 @@ spec:
         fi
 
         START_RANK=$(( ${LWS_WORKER_INDEX:-0} * {{ or .Spec.Parallelism.DataLocal 1 }} ))
+
+        # --disable-access-log-for-endpoints landed in vLLM 0.16.0 (vllm-project/vllm#30011).
+        # Older versions still need the blanket --disable-uvicorn-access-log.
+        ACCESS_LOG_ARGS="--disable-uvicorn-access-log"
+        VLLM_VERSION=$(vllm --version 2>/dev/null | tail -1 | awk '{print $NF}')
+        echo "[access-log-detect] vllm version='${VLLM_VERSION}'"
+        if [[ "$VLLM_VERSION" =~ ^[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n%s\n' "0.16.0" "${VLLM_VERSION}" | sort -V | head -1)" = "0.16.0" ]; then
+          ACCESS_LOG_ARGS="--disable-access-log-for-endpoints /health,/metrics,/ping"
+        fi
+        echo "[access-log-detect] selected ACCESS_LOG_ARGS='${ACCESS_LOG_ARGS}'"
+
         eval "vllm serve \
           /mnt/models \
           --served-model-name "{{ .Spec.Model.Name }}" \
@@ -4174,16 +4888,13 @@ spec:
           --data-parallel-address ${DP_ADDRESS} \
           --data-parallel-rpc-port {{ if .Spec.Parallelism.DataRPCPort }}{{ .Spec.Parallelism.DataRPCPort }}{{ else }}5555{{- end }} \
           --data-parallel-start-rank $START_RANK \
+          --headless \
+          ${ACCESS_LOG_ARGS} \
+          {{ if .GlobalConfig.EnableTLS }}--enable-ssl-refresh{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-certfile /var/run/kserve/tls/tls.crt{{- end }} \
+          {{ if .GlobalConfig.EnableTLS }}--ssl-keyfile /var/run/kserve/tls/tls.key{{- end }} \
           ${VLLM_ADDITIONAL_ARGS} \
-          $@ \
-          --trust-remote-code \
-          --headless"
-          # BackendTLSPolicy is not implemented yet so disable SSL for now
-          # --enable-ssl-refresh \
-          # --ssl-certfile \
-          # /var/run/kserve/tls/tls.crt \
-          # --ssl-keyfile \
-          # /var/run/kserve/tls/tls.key
+          $@"
       - --
       env:
       - name: HOME
@@ -4192,7 +4903,7 @@ spec:
         value: INFO
       - name: HF_HUB_CACHE
         value: /models
-      image: ghcr.io/llm-d/llm-d-cuda:v0.4.0
+      image: ghcr.io/llm-d/llm-d-cuda:v0.6.0
       imagePullPolicy: IfNotPresent
       name: main
       ports:
@@ -4207,8 +4918,8 @@ spec:
           - NET_RAW
           drop:
           - ALL
-        readOnlyRootFilesystem: false
-        runAsNonRoot: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       terminationMessagePath: /dev/termination-log
@@ -4216,6 +4927,8 @@ spec:
       volumeMounts:
       - mountPath: /home
         name: home
+      - mountPath: /tmp
+        name: tmp-dir
       - mountPath: /dev/shm
         name: dshm
       - mountPath: /models
@@ -4227,6 +4940,8 @@ spec:
     volumes:
     - emptyDir: {}
       name: home
+    - emptyDir: {}
+      name: tmp-dir
     - emptyDir:
         medium: Memory
         sizeLimit: 8Gi
@@ -5090,6 +5805,18 @@ spec:
                     properties:
                       adapters:
                         x-kubernetes-preserve-unknown-fields: true
+                      maxAdapters:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxCpuAdapters:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxRank:
+                        format: int32
+                        minimum: 1
+                        type: integer
                     type: object
                   name:
                     type: string
@@ -5171,6 +5898,7 @@ spec:
                         minimum: 1
                         type: integer
                       minReplicas:
+                        default: 1
                         format: int32
                         minimum: 1
                         type: integer
@@ -5401,16 +6129,15 @@ spec:
                         - message: either hpa or keda must be specified as the actuator
                             backend
                           rule: has(self.hpa) || has(self.keda)
+                    required:
+                    - maxReplicas
                     type: object
                     x-kubernetes-validations:
-                    - message: maxReplicas is required when scaling is configured
-                      rule: has(self.maxReplicas)
                     - message: wva is required when scaling is configured; it provides
                         the autoscaling mechanism
                       rule: has(self.wva)
                     - message: minReplicas cannot exceed maxReplicas
-                      rule: '!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas
-                        <= self.maxReplicas'
+                      rule: '!has(self.minReplicas) || self.minReplicas <= self.maxReplicas'
                     - message: minReplicas is required when idleReplicaCount is set;
                         idleReplicaCount must be less than minReplicas
                       rule: '!has(self.wva) || !has(self.wva.keda) || !has(self.wva.keda.idleReplicaCount)
@@ -12981,6 +13708,11 @@ spec:
                               minLength: 1
                               pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                               type: string
+                            sectionName:
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                              type: string
                           type: object
                         type: array
                     type: object
@@ -18395,6 +19127,7 @@ spec:
                     minimum: 1
                     type: integer
                   minReplicas:
+                    default: 1
                     format: int32
                     minimum: 1
                     type: integer
@@ -18625,16 +19358,15 @@ spec:
                     - message: either hpa or keda must be specified as the actuator
                         backend
                       rule: has(self.hpa) || has(self.keda)
+                required:
+                - maxReplicas
                 type: object
                 x-kubernetes-validations:
-                - message: maxReplicas is required when scaling is configured
-                  rule: has(self.maxReplicas)
                 - message: wva is required when scaling is configured; it provides
                     the autoscaling mechanism
                   rule: has(self.wva)
                 - message: minReplicas cannot exceed maxReplicas
-                  rule: '!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas
-                    <= self.maxReplicas'
+                  rule: '!has(self.minReplicas) || self.minReplicas <= self.maxReplicas'
                 - message: minReplicas is required when idleReplicaCount is set; idleReplicaCount
                     must be less than minReplicas
                   rule: '!has(self.wva) || !has(self.wva.keda) || !has(self.wva.keda.idleReplicaCount)
@@ -26228,6 +26960,18 @@ spec:
                     properties:
                       adapters:
                         x-kubernetes-preserve-unknown-fields: true
+                      maxAdapters:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxCpuAdapters:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxRank:
+                        format: int32
+                        minimum: 1
+                        type: integer
                     type: object
                   name:
                     type: string
@@ -26309,6 +27053,7 @@ spec:
                         minimum: 1
                         type: integer
                       minReplicas:
+                        default: 1
                         format: int32
                         minimum: 1
                         type: integer
@@ -26539,16 +27284,15 @@ spec:
                         - message: either hpa or keda must be specified as the actuator
                             backend
                           rule: has(self.hpa) || has(self.keda)
+                    required:
+                    - maxReplicas
                     type: object
                     x-kubernetes-validations:
-                    - message: maxReplicas is required when scaling is configured
-                      rule: has(self.maxReplicas)
                     - message: wva is required when scaling is configured; it provides
                         the autoscaling mechanism
                       rule: has(self.wva)
                     - message: minReplicas cannot exceed maxReplicas
-                      rule: '!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas
-                        <= self.maxReplicas'
+                      rule: '!has(self.minReplicas) || self.minReplicas <= self.maxReplicas'
                     - message: minReplicas is required when idleReplicaCount is set;
                         idleReplicaCount must be less than minReplicas
                       rule: '!has(self.wva) || !has(self.wva.keda) || !has(self.wva.keda.idleReplicaCount)
@@ -34099,10 +34843,6 @@ spec:
                 - message: replicas and scaling are mutually exclusive; use scaling
                     for autoscaled deployments or replicas for static deployments
                   rule: '!(has(self.replicas) && has(self.scaling))'
-                - message: autoscaling (scaling) is not supported for multi-node deployments
-                    (worker is set); remove scaling and use replicas instead to set
-                    a fixed replica count
-                  rule: '!(has(self.worker) && has(self.scaling))'
               replicas:
                 format: int32
                 minimum: 0
@@ -34122,6 +34862,11 @@ spec:
                               maxLength: 63
                               minLength: 1
                               pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                              type: string
+                            sectionName:
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                               type: string
                           type: object
                         type: array
@@ -39485,6 +40230,7 @@ spec:
                     minimum: 1
                     type: integer
                   minReplicas:
+                    default: 1
                     format: int32
                     minimum: 1
                     type: integer
@@ -39715,16 +40461,15 @@ spec:
                     - message: either hpa or keda must be specified as the actuator
                         backend
                       rule: has(self.hpa) || has(self.keda)
+                required:
+                - maxReplicas
                 type: object
                 x-kubernetes-validations:
-                - message: maxReplicas is required when scaling is configured
-                  rule: has(self.maxReplicas)
                 - message: wva is required when scaling is configured; it provides
                     the autoscaling mechanism
                   rule: has(self.wva)
                 - message: minReplicas cannot exceed maxReplicas
-                  rule: '!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas
-                    <= self.maxReplicas'
+                  rule: '!has(self.minReplicas) || self.minReplicas <= self.maxReplicas'
                 - message: minReplicas is required when idleReplicaCount is set; idleReplicaCount
                     must be less than minReplicas
                   rule: '!has(self.wva) || !has(self.wva.keda) || !has(self.wva.keda.idleReplicaCount)
@@ -47280,10 +48025,6 @@ spec:
             - message: replicas and scaling are mutually exclusive; use scaling for
                 autoscaled deployments or replicas for static deployments
               rule: '!(has(self.replicas) && has(self.scaling))'
-            - message: autoscaling (scaling) is not supported for multi-node deployments
-                (worker is set); remove scaling and use replicas instead to set a
-                fixed replica count
-              rule: '!(has(self.worker) && has(self.scaling))'
         type: object
     served: true
     storage: true
@@ -47376,6 +48117,18 @@ spec:
                     properties:
                       adapters:
                         x-kubernetes-preserve-unknown-fields: true
+                      maxAdapters:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxCpuAdapters:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxRank:
+                        format: int32
+                        minimum: 1
+                        type: integer
                     type: object
                   name:
                     type: string
@@ -47457,6 +48210,7 @@ spec:
                         minimum: 1
                         type: integer
                       minReplicas:
+                        default: 1
                         format: int32
                         minimum: 1
                         type: integer
@@ -47687,16 +48441,15 @@ spec:
                         - message: either hpa or keda must be specified as the actuator
                             backend
                           rule: has(self.hpa) || has(self.keda)
+                    required:
+                    - maxReplicas
                     type: object
                     x-kubernetes-validations:
-                    - message: maxReplicas is required when scaling is configured
-                      rule: has(self.maxReplicas)
                     - message: wva is required when scaling is configured; it provides
                         the autoscaling mechanism
                       rule: has(self.wva)
                     - message: minReplicas cannot exceed maxReplicas
-                      rule: '!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas
-                        <= self.maxReplicas'
+                      rule: '!has(self.minReplicas) || self.minReplicas <= self.maxReplicas'
                     - message: minReplicas is required when idleReplicaCount is set;
                         idleReplicaCount must be less than minReplicas
                       rule: '!has(self.wva) || !has(self.wva.keda) || !has(self.wva.keda.idleReplicaCount)
@@ -55267,6 +56020,11 @@ spec:
                               minLength: 1
                               pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                               type: string
+                            sectionName:
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                              type: string
                           type: object
                         type: array
                     type: object
@@ -60681,6 +61439,7 @@ spec:
                     minimum: 1
                     type: integer
                   minReplicas:
+                    default: 1
                     format: int32
                     minimum: 1
                     type: integer
@@ -60911,16 +61670,15 @@ spec:
                     - message: either hpa or keda must be specified as the actuator
                         backend
                       rule: has(self.hpa) || has(self.keda)
+                required:
+                - maxReplicas
                 type: object
                 x-kubernetes-validations:
-                - message: maxReplicas is required when scaling is configured
-                  rule: has(self.maxReplicas)
                 - message: wva is required when scaling is configured; it provides
                     the autoscaling mechanism
                   rule: has(self.wva)
                 - message: minReplicas cannot exceed maxReplicas
-                  rule: '!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas
-                    <= self.maxReplicas'
+                  rule: '!has(self.minReplicas) || self.minReplicas <= self.maxReplicas'
                 - message: minReplicas is required when idleReplicaCount is set; idleReplicaCount
                     must be less than minReplicas
                   rule: '!has(self.wva) || !has(self.wva.keda) || !has(self.wva.keda.idleReplicaCount)
@@ -68529,6 +69287,126 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              router:
+                properties:
+                  gateways:
+                    items:
+                      properties:
+                        group:
+                          maxLength: 253
+                          pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                          type: string
+                        httpRoutes:
+                          items:
+                            properties:
+                              group:
+                                maxLength: 253
+                                pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                type: string
+                              kind:
+                                maxLength: 63
+                                minLength: 1
+                                pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                                type: string
+                              name:
+                                maxLength: 253
+                                minLength: 1
+                                type: string
+                              namespace:
+                                maxLength: 63
+                                minLength: 1
+                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                                type: string
+                            required:
+                            - group
+                            - kind
+                            - name
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        kind:
+                          maxLength: 63
+                          minLength: 1
+                          pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                          type: string
+                        listeners:
+                          items:
+                            maxLength: 253
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        name:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        namespace:
+                          maxLength: 63
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                      required:
+                      - group
+                      - kind
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  scheduler:
+                    properties:
+                      inferencePool:
+                        properties:
+                          group:
+                            maxLength: 253
+                            pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          kind:
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                            type: string
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          namespace:
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                        required:
+                        - group
+                        - kind
+                        - name
+                        type: object
+                      service:
+                        properties:
+                          group:
+                            maxLength: 253
+                            pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          kind:
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                            type: string
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          namespace:
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                        required:
+                        - group
+                        - kind
+                        - name
+                        type: object
+                    type: object
+                type: object
               url:
                 type: string
             type: object
@@ -68589,6 +69467,18 @@ spec:
                     properties:
                       adapters:
                         x-kubernetes-preserve-unknown-fields: true
+                      maxAdapters:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxCpuAdapters:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxRank:
+                        format: int32
+                        minimum: 1
+                        type: integer
                     type: object
                   name:
                     type: string
@@ -68670,6 +69560,7 @@ spec:
                         minimum: 1
                         type: integer
                       minReplicas:
+                        default: 1
                         format: int32
                         minimum: 1
                         type: integer
@@ -68900,16 +69791,15 @@ spec:
                         - message: either hpa or keda must be specified as the actuator
                             backend
                           rule: has(self.hpa) || has(self.keda)
+                    required:
+                    - maxReplicas
                     type: object
                     x-kubernetes-validations:
-                    - message: maxReplicas is required when scaling is configured
-                      rule: has(self.maxReplicas)
                     - message: wva is required when scaling is configured; it provides
                         the autoscaling mechanism
                       rule: has(self.wva)
                     - message: minReplicas cannot exceed maxReplicas
-                      rule: '!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas
-                        <= self.maxReplicas'
+                      rule: '!has(self.minReplicas) || self.minReplicas <= self.maxReplicas'
                     - message: minReplicas is required when idleReplicaCount is set;
                         idleReplicaCount must be less than minReplicas
                       rule: '!has(self.wva) || !has(self.wva.keda) || !has(self.wva.keda.idleReplicaCount)
@@ -76460,10 +77350,6 @@ spec:
                 - message: replicas and scaling are mutually exclusive; use scaling
                     for autoscaled deployments or replicas for static deployments
                   rule: '!(has(self.replicas) && has(self.scaling))'
-                - message: autoscaling (scaling) is not supported for multi-node deployments
-                    (worker is set); remove scaling and use replicas instead to set
-                    a fixed replica count
-                  rule: '!(has(self.worker) && has(self.scaling))'
               replicas:
                 format: int32
                 minimum: 0
@@ -76483,6 +77369,11 @@ spec:
                               maxLength: 63
                               minLength: 1
                               pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                              type: string
+                            sectionName:
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                               type: string
                           type: object
                         type: array
@@ -81928,6 +82819,7 @@ spec:
                     minimum: 1
                     type: integer
                   minReplicas:
+                    default: 1
                     format: int32
                     minimum: 1
                     type: integer
@@ -82158,16 +83050,15 @@ spec:
                     - message: either hpa or keda must be specified as the actuator
                         backend
                       rule: has(self.hpa) || has(self.keda)
+                required:
+                - maxReplicas
                 type: object
                 x-kubernetes-validations:
-                - message: maxReplicas is required when scaling is configured
-                  rule: has(self.maxReplicas)
                 - message: wva is required when scaling is configured; it provides
                     the autoscaling mechanism
                   rule: has(self.wva)
                 - message: minReplicas cannot exceed maxReplicas
-                  rule: '!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas
-                    <= self.maxReplicas'
+                  rule: '!has(self.minReplicas) || self.minReplicas <= self.maxReplicas'
                 - message: minReplicas is required when idleReplicaCount is set; idleReplicaCount
                     must be less than minReplicas
                   rule: '!has(self.wva) || !has(self.wva.keda) || !has(self.wva.keda.idleReplicaCount)
@@ -89723,10 +90614,6 @@ spec:
             - message: replicas and scaling are mutually exclusive; use scaling for
                 autoscaled deployments or replicas for static deployments
               rule: '!(has(self.replicas) && has(self.scaling))'
-            - message: autoscaling (scaling) is not supported for multi-node deployments
-                (worker is set); remove scaling and use replicas instead to set a
-                fixed replica count
-              rule: '!(has(self.worker) && has(self.scaling))'
           status:
             properties:
               address:
@@ -89780,8 +90667,183 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              router:
+                properties:
+                  gateways:
+                    items:
+                      properties:
+                        group:
+                          maxLength: 253
+                          pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                          type: string
+                        httpRoutes:
+                          items:
+                            properties:
+                              group:
+                                maxLength: 253
+                                pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                type: string
+                              kind:
+                                maxLength: 63
+                                minLength: 1
+                                pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                                type: string
+                              name:
+                                maxLength: 253
+                                minLength: 1
+                                type: string
+                              namespace:
+                                maxLength: 63
+                                minLength: 1
+                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                                type: string
+                            required:
+                            - group
+                            - kind
+                            - name
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        kind:
+                          maxLength: 63
+                          minLength: 1
+                          pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                          type: string
+                        listeners:
+                          items:
+                            maxLength: 253
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        name:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        namespace:
+                          maxLength: 63
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                      required:
+                      - group
+                      - kind
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  scheduler:
+                    properties:
+                      inferencePool:
+                        properties:
+                          group:
+                            maxLength: 253
+                            pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          kind:
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                            type: string
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          namespace:
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                        required:
+                        - group
+                        - kind
+                        - name
+                        type: object
+                      service:
+                        properties:
+                          group:
+                            maxLength: 253
+                            pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          kind:
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                            type: string
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          namespace:
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                        required:
+                        - group
+                        - kind
+                        - name
+                        type: object
+                    type: object
+                type: object
               url:
                 type: string
+              workloads:
+                properties:
+                  prefill:
+                    properties:
+                      apiGroup:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - kind
+                    - name
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  primary:
+                    properties:
+                      apiGroup:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - kind
+                    - name
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  scheduler:
+                    properties:
+                      apiGroup:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - kind
+                    - name
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  service:
+                    properties:
+                      apiGroup:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - kind
+                    - name
+                    type: object
+                    x-kubernetes-map-type: atomic
+                type: object
             type: object
         type: object
     served: true
@@ -89865,6 +90927,27 @@ rules:
   - update
   - watch
 - apiGroups:
+  - apiextensions.k8s.io
+  resourceNames:
+  - llminferenceserviceconfigs.serving.kserve.io
+  - llminferenceservices.serving.kserve.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apiextensions.k8s.io
+  resourceNames:
+  - llminferenceserviceconfigs.serving.kserve.io
+  - llminferenceservices.serving.kserve.io
+  resources:
+  - customresourcedefinitions/status
+  verbs:
+  - patch
+  - update
+- apiGroups:
   - apps
   resources:
   - deployments
@@ -89889,6 +90972,18 @@ rules:
   - subjectaccessreviews
   verbs:
   - create
+- apiGroups:
+  - autoscaling
+  resources:
+  - horizontalpodautoscalers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -89925,7 +91020,6 @@ rules:
   - watch
 - apiGroups:
   - inference.networking.k8s.io
-  - inference.networking.x-k8s.io
   resources:
   - inferencemodels
   - inferenceobjectives
@@ -89939,9 +91033,49 @@ rules:
   - update
   - watch
 - apiGroups:
+  - inference.networking.x-k8s.io
+  resources:
+  - inferencemodelrewrites
+  - inferencemodels
+  - inferenceobjectives
+  - inferencepoolimports
+  - inferencepools
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - keda.sh
+  resources:
+  - scaledobjects
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - leaderworkerset.x-k8s.io
   resources:
   - leaderworkersets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - llmd.ai
+  resources:
+  - variantautoscalings
   verbs:
   - create
   - delete
@@ -90004,6 +91138,15 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - serving.kserve.io
+  resources:
+  - localmodelcaches
+  - localmodelnamespacecaches
+  verbs:
+  - get
+  - list
+  - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -90034,342 +91177,630 @@ subjects:
 ---
 apiVersion: v1
 data:
-  _example: "################################\n#                              #\n#
-    \   EXAMPLE CONFIGURATION     #\n#                              #\n################################\n\n#
-    This block is not actually functional configuration,\n# but serves to illustrate
-    the available configuration\n# options and document them in a way that is accessible\n#
-    to users that `kubectl edit` this config map.\n#\n# These sample configuration
-    options may be copied out of\n# this example block and unindented to be in the
-    data block\n# to actually change the configuration.\n\n# ======================================
-    EXPLAINERS CONFIGURATION ======================================\n# Example\nexplainers:
-    |-\n  {\n      \"art\": {\n          \"image\" : \"kserve/art-explainer\",\n          \"defaultImageVersion\":
-    \"latest\"\n      }\n  }\n# Art Explainer runtime configuration\n explainers:
-    |-\n   {\n       # Art explainer runtime configuration\n       \"art\": {\n           #
-    image contains the default Art explainer serving runtime image uri.\n           \"image\"
-    : \"kserve/art-explainer\",\n   \n           # defautltImageVersion contains the
-    Art explainer serving runtime default image version.\n           \"defaultImageVersion\":
-    \"latest\"\n       }\n   }\n# ====================================== ISVC CONFIGURATION
-    ======================================\n# Example - setting custom annotation
-    \ \n inferenceService: |-\n   {\n     \"serviceAnnotationDisallowedList\": [\n
-    \       \"my.custom.annotation/1\"  \n     ],\n     \"serviceLabelDisallowedList\":
-    [\n        \"my.custom.label.1\"  \n     ]\n   }\n# Example - setting custom annotation\ninferenceService:
-    |-\n  {\n    # ServiceAnnotationDisallowedList is a list of annotations that are
-    not allowed to be propagated to Knative \n    # revisions, which prevents the
-    reconciliation loop to be triggered if the annotations is \n    # configured here
-    are used.\n    # Default values are:\n    #  \"autoscaling.knative.dev/min-scale\",\n
-    \   #  \"autoscaling.knative.dev/max-scale\",\n    #  \"internal.serving.kserve.io/storage-initializer-sourceuri\",\n
-    \   #  \"kubectl.kubernetes.io/last-applied-configuration\",\n    #  \"modelFormat\"\n
-    \   # Any new value will be appended to the list.\n    \"serviceAnnotationDisallowedList\":
-    [\n      \"my.custom.annotation/1\"  \n    ],\n    # ServiceLabelDisallowedList
-    is a list of labels that are not allowed to be propagated to Knative revisions\n
-    \   # which prevents the reconciliation loop to be triggered if the labels is
-    configured here are used.\n    \"serviceLabelDisallowedList\": [\n      \"my.custom.label.1\"
-    \ \n    ]\n  } \n# Example - setting custom resource\ninferenceService: |-\n  {\n
-    \   \"resource\": {\n      \"cpuLimit\": \"1\",\n      \"memoryLimit\": \"2Gi\",\n
-    \     \"cpuRequest\": \"1\",\n      \"memoryRequest\": \"2Gi\"\n    }\n  }\n#
-    Example - setting custom resource\ninferenceService: |-\n  {\n    # resource contains
-    the default resource configuration for the inference service.\n    # you can override
-    this configuration by specifying the resources in the inference service yaml.\n
-    \   # If you want to unbound the resource (limits and requests), you can set the
-    value to null or \"\" \n    # or just remove the specific field from the config.\n
-    \   \"resource\": {\n       # cpuLimit is the limits.cpu to set for the inference
-    service.\n       \"cpuLimit\": \"1\",\n\n       # memoryLimit is the limits.memory
-    to set for the inference service.\n       \"memoryLimit\": \"2Gi\",\n\n       #
-    cpuRequest is the requests.cpu to set for the inference service.\n       \"cpuRequest\":
-    \"1\",\n\n       # memoryRequest is the requests.memory to set for the inference
-    service.\n       \"memoryRequest\": \"2Gi\"\n    }\n }\n# ======================================
-    MultiNode CONFIGURATION ======================================\n# Example   \nmultiNode:
-    |-\n  {\n    \"customGPUResourceTypeList\": [\n      \"custom.com/gpu\"\n    ]\n
-    \ }\n# Example of multinode configuration\nmultiNode: |-\n  {      \n    # CustomGPUResourceTypeList
-    is a list of custom GPU resource types intended to identify the GPU type of a
-    resource,\n    # not to restrict the user from using a specific GPU type.\n    #
-    The MultiNode runtime pod will dynamically add GPU resources based on the registered
-    GPU types.\n    \"customGPUResourceTypeList\": [\n      \"custom.com/gpu\"\n    ]\n
-    \ }  \n # ====================================== OTelCollector CONFIGURATION ======================================\n
-    # Example\n opentelemetryCollector: |-\n   {\n     # scrapeInterval is the interval
-    at which the OpenTelemetry Collector will scrape the metrics.\n     \"scrapeInterval\":
-    \"5s\",\n     # metricScalerEndpoint is the endpoint from which the KEDA's ScaledObject
-    will scrape the metrics.\n     \"metricScalerEndpoint\": \"keda-otel-scaler.keda.svc:4318\",\n
-    \    # metricReceiverEndpoint is the endpoint from which the OpenTelemetry Collector
-    will scrape the metrics.\n      \"metricReceiverEndpoint\": \"keda-otel-scaler.keda.svc:4317\"\n
-    \  }\n\n # ====================================== AUTOSCALER CONFIGURATION ======================================\n
-    # Example\n autoscaler: |-\n   {\n     # scaleUpStabilizationWindowSeconds is
-    the stabilization window in seconds for scale up.\n     \"scaleUpStabilizationWindowSeconds\":
-    \"0\",\n     # scaleDownStabilizationWindowSeconds is the stabilization window
-    in seconds for scale down.\n     \"scaleDownStabilizationWindowSeconds\": \"300\"\n
-    \  }\n  \n # ====================================== STORAGE INITIALIZER CONFIGURATION
-    ======================================\n # Example\n storageInitializer: |-\n
-    \  {\n       \"image\" : \"kserve/storage-initializer:latest\",\n       \"memoryRequest\":
-    \"100Mi\",\n       \"memoryLimit\": \"1Gi\",\n       \"cpuRequest\": \"100m\",\n
-    \      \"cpuLimit\": \"1\",\n       \"caBundleConfigMapName\": \"\",\n       \"caBundleVolumeMountPath\":
-    \"/etc/ssl/custom-certs\",\n       \"enableModelcar\": false,\n       \"cpuModelcar\":
-    \"10m\",\n       \"memoryModelcar\": \"15Mi\"\n   }\n storageInitializer: |-\n
-    \  {\n       # image contains the default storage initializer image uri.\n       \"image\"
-    : \"kserve/storage-initializer:latest\",\n       \n       # memoryRequest is the
-    requests.memory to set for the storage initializer init container.\n       \"memoryRequest\":
-    \"100Mi\",\n   \n        # memoryLimit is the limits.memory to set for the storage
-    initializer init container.\n       \"memoryLimit\": \"1Gi\",\n       \n       #
-    cpuRequest is the requests.cpu to set for the storage initializer init container.\n
-    \      \"cpuRequest\": \"100m\",\n       \n       # cpuLimit is the limits.cpu
-    to set for the storage initializer init container.\n       \"cpuLimit\": \"1\",\n
-    \  \n       # caBundleConfigMapName is the ConfigMap will be copied to a user
-    namespace for the storage initializer init container.\n       \"caBundleConfigMapName\":
-    \"\",\n\n       # caBundleVolumeMountPath is the mount point for the configmap
-    set by caBundleConfigMapName for the storage initializer init container.\n       \"caBundleVolumeMountPath\":
-    \"/etc/ssl/custom-certs\",\n\n       # enableModelcar enabled allows you to directly
-    access an OCI container image by\n       # using a source URL with an \"oci://\"
-    schema.\n       \"enableModelcar\": false,\n\n       # cpuModelcar is the cpu
-    request and limit that is used for the passive modelcar container. It can be\n
-    \      # set very low, but should be allowed by any Kubernetes LimitRange that
-    might apply.\n       \"cpuModelcar\": \"10m\",\n\n       # cpuModelcar is the
-    memory request and limit that is used for the passive modelcar container. It can
-    be\n       # set very low, but should be allowed by any Kubernetes LimitRange
-    that might apply.\n       \"memoryModelcar\": \"15Mi\",\n\n       # uidModelcar
-    is the UID under with which the modelcar process and the main container is running.\n
-    \      # Some Kubernetes clusters might require this to be root (0). If not set
-    the user id is left untouched (default)\n       \"uidModelcar\": 10\n   }\n \n
-    # ====================================== CREDENTIALS ======================================\n
-    # Example\n credentials: |-\n   {\n      \"storageSpecSecretName\": \"storage-config\",\n
-    \     \"storageSecretNameAnnotation\": \"serving.kserve.io/storageSecretName\",\n
-    \     \"gcs\": {\n          \"gcsCredentialFileName\": \"gcloud-application-credentials.json\"\n
-    \     },\n      \"s3\": {\n          \"s3AccessKeyIDName\": \"AWS_ACCESS_KEY_ID\",\n
-    \         \"s3SecretAccessKeyName\": \"AWS_SECRET_ACCESS_KEY\",\n          \"s3Endpoint\":
-    \"\",\n          \"s3UseHttps\": \"\",\n          \"s3Region\": \"\",\n          \"s3VerifySSL\":
-    \"\",\n          \"s3UseVirtualBucket\": \"\",\n          \"s3UseAccelerate\":
-    \"\",\n          \"s3UseAnonymousCredential\": \"\",\n          \"s3CABundleConfigMap\":
-    \"\",\n          \"s3CABundle\": \"\"\n      }\n   }\n # This is a global configuration
-    used for downloading models from the cloud storage.\n # You can override this
-    configuration by specifying the annotations on service account or static secret.\n
-    # https://kserve.github.io/website/master/modelserving/storage/s3/s3/\n # For
-    a quick reference about AWS ENV variables:\n # AWS Cli: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html\n
-    # Boto: https://boto3.amazonaws.com/v1/documentation/api/latest/guide/configuration.html#using-environment-variables\n
-    #\n # The `s3AccessKeyIDName` and `s3SecretAccessKeyName` fields are only used
-    from this configmap when static credentials (IAM User Access Key Secret)\n # are
-    used as the authentication method for AWS S3.\n # The rest of the fields are used
-    in both authentication methods (IAM Role for Service Account & IAM User Access
-    Key Secret) if a non-empty value is provided.\n credentials: |-\n   {\n      #
-    storageSpecSecretName contains the secret name which has the credentials for downloading
-    the model.\n      # This option is used when specifying the storage spec on isvc
-    yaml.\n      \"storageSpecSecretName\": \"storage-config\",\n\n      # The annotation
-    can be specified on isvc yaml to allow overriding with the secret name reference
-    from the annotation value.\n      # When using storageUri the order of the precedence
-    is: secret name reference annotation > secret name references from service account\n
-    \     # When using storageSpec the order of the precedence is: secret name reference
-    annotation > storageSpecSecretName in configmap\n\n      # Configuration for google
-    cloud storage\n      \"gcs\": {\n          # gcsCredentialFileName specifies the
-    filename of the gcs credential\n          \"gcsCredentialFileName\": \"gcloud-application-credentials.json\"\n
-    \     },\n      \n      # Configuration for aws s3 storage. This add the corresponding
-    environmental variables to the storage initializer init container.\n      # For
-    more info on s3 storage see https://kserve.github.io/website/master/modelserving/storage/s3/s3/\n
-    \     \"s3\": {\n          # s3AccessKeyIDName specifies the s3 access key id
-    name\n          \"s3AccessKeyIDName\": \"AWS_ACCESS_KEY_ID\",\n   \n          #
-    s3SecretAccessKeyName specifies the s3 secret access key name\n          \"s3SecretAccessKeyName\":
-    \"AWS_SECRET_ACCESS_KEY\",\n          \n          # s3Endpoint specifies the s3
-    endpoint\n          \"s3Endpoint\": \"\",\n          \n          # s3UseHttps
-    controls whether to use secure https or unsecure http to download models.\n          #
-    Allowed values are 0 and 1.\n          \"s3UseHttps\": \"\",\n   \n          #
-    s3Region specifies the region of the bucket.\n          \"s3Region\": \"\",\n
-    \         \n          # s3VerifySSL controls whether to verify the tls/ssl certificate.\n
-    \         \"s3VerifySSL\": \"\",\n          \n          # s3UseVirtualBucket configures
-    whether it is a virtual bucket or not.\n          \"s3UseVirtualBucket\": \"\",\n\n
-    \         # s3UseAccelerate configures whether to use transfer acceleration.\n
-    \         \"s3UseAccelerate\": \"\",\n           \n          # s3UseAnonymousCredential
-    configures whether to use anonymous credentials to download the model or not.\n
-    \         \"s3UseAnonymousCredential\": \"\",\n\n          # s3CABundleConfigMap
-    specifies the mounted CA bundle config map name.\n          \"s3CABundleConfigMap\":
-    \"\",\n\n          # s3CABundle specifies the full path (mount path + file name)
-    for the mounted config map data when used with a configured CA bundle config map.\n
-    \         # s3CABundle specifies the path to a certificate bundle to use for HTTPS
-    certificate validation when used absent of a configured CA bundle config map.\n
-    \         \"s3CABundle\": \"\"\n      }\n   }\n \n # ======================================
-    INGRESS CONFIGURATION ======================================\n # Example\n ingress:
-    |-\n   {    \n       \"enableGatewayApi\": false,\n       \"kserveIngressGateway\":
-    \"kserve/kserve-ingress-gateway\",\n       \"ingressGateway\" : \"knative-serving/knative-ingress-gateway\",\n
-    \      \"localGateway\" : \"knative-serving/knative-local-gateway\",\n       \"localGatewayService\"
-    : \"knative-local-gateway.istio-system.svc.cluster.local\",\n       \"ingressDomain\"
-    \ : \"example.com\",\n       \"additionalIngressDomains\": [\"additional-example.com\",
-    \"additional-example-1.com\"],\n       \"ingressClassName\" : \"istio\",\n       \"domainTemplate\":
-    \"{{ .Name }}-{{ .Namespace }}.{{ .IngressDomain }}\",\n       \"urlScheme\":
-    \"http\",\n       \"disableIstioVirtualHost\": false,\n       \"disableIngressCreation\":
-    false\n   }\n ingress: |-\n   {   \n       # enableGatewayApi specifies whether
-    to use Gateway API instead of Ingress to serve external traffic.\n       \"enableGatewayApi\":
-    false,\n\n       # KServe implements [Gateway API](https://gateway-api.sigs.k8s.io/)
-    to serve external traffic. \n       # By default, KServe configures a default
-    gateway to serve external traffic.\n       # But, KServe can be configured to
-    use a custom gateway by modifying this configuration.\n       # The gateway should
-    be specified in format <gateway namespace>/<gateway name>\n       # NOTE: This
-    configuration only applicable for raw deployment.\n       \"kserveIngressGateway\":
-    \"kserve/kserve-ingress-gateway\",\n \n       # ingressGateway specifies the ingress
-    gateway to serve external traffic.\n       # The gateway should be specified in
-    format <gateway namespace>/<gateway name>\n       # NOTE: This configuration only
-    applicable for serverless deployment with Istio configured as network layer.\n
-    \      \"ingressGateway\" : \"knative-serving/knative-ingress-gateway\",\n \n
-    \      # knativeLocalGatewayService specifies the hostname of the Knative's local
-    gateway service.\n       # The default KServe configurations are re-using the
-    Istio local gateways for Knative. In this case, this\n       # knativeLocalGatewayService
-    field can be left unset. When unset, the value of \"localGatewayService\" will
-    be used.\n       # However, sometimes it may be better to have local gateways
-    specifically for KServe (e.g. when enabling strict mTLS in Istio).\n       # Under
-    such setups where KServe is needed to have its own local gateways, the values
-    of the \"localGateway\" and\n       # \"localGatewayService\" should point to
-    the KServe local gateways. Then, this knativeLocalGatewayService field\n       #
-    should point to the Knative's local gateway service.\n       # NOTE: This configuration
-    only applicable for serverless deployment with Istio configured as network layer.\n
-    \      \"knativeLocalGatewayService\": \"\",\n \n       # localGateway specifies
-    the gateway which handles the network traffic within the cluster.\n       # NOTE:
-    This configuration only applicable for serverless deployment with Istio configured
-    as network layer.\n       \"localGateway\" : \"knative-serving/knative-local-gateway\",\n
-    \n       # localGatewayService specifies the hostname of the local gateway service.\n
-    \      # NOTE: This configuration only applicable for serverless deployment with
-    Istio configured as network layer.\n       \"localGatewayService\" : \"knative-local-gateway.istio-system.svc.cluster.local\",\n
-    \n       # ingressDomain specifies the domain name which is used for creating
-    the url.\n       # If ingressDomain is empty then example.com is used as default
-    domain.\n       # NOTE: This configuration only applicable for raw deployment.\n
-    \      \"ingressDomain\"  : \"example.com\",\n\n       # additionalIngressDomains
-    specifies the additional domain names which are used for creating the url.\n       \"additionalIngressDomains\":
-    [\"additional-example.com\", \"additional-example-1.com\"]\n\n       # ingressClassName
-    specifies the ingress controller to use for ingress traffic.\n       # This is
-    optional and if omitted the default ingress in the cluster is used.\n       #
-    https://kubernetes.io/docs/concepts/services-networking/ingress/#default-ingress-class\n
-    \      # NOTE: This configuration only applicable for raw deployment.\n       \"ingressClassName\"
-    : \"istio\",\n \n       # domainTemplate specifies the template for generating
-    domain/url for each inference service by combining variable from:\n       # Name
-    of the inference service  ( {{ .Name}} )\n       # Namespace of the inference
-    service ( {{ .Namespace }} )\n       # Annotation of the inference service ( {{
-    .Annotations.key }} )\n       # Label of the inference service ( {{ .Labels.key
-    }} )\n       # IngressDomain ( {{ .IngressDomain }} )\n       # If domain template
-    is empty the default template {{ .Name }}-{{ .Namespace }}.{{ .IngressDomain }}
-    is used.\n       # NOTE: This configuration only applicable for raw deployment.\n
-    \      \"domainTemplate\": \"{{ .Name }}-{{ .Namespace }}.{{ .IngressDomain }}\",\n
-    \n       # urlScheme specifies the url scheme to use for inference service and
-    inference graph.\n       # If urlScheme is empty then by default http is used.\n
-    \      \"urlScheme\": \"http\",\n \n       # disableIstioVirtualHost controls
-    whether to use istio as network layer.\n       # By default istio is used as the
-    network layer. When DisableIstioVirtualHost is true, KServe does not\n       #
-    create the top level virtual service thus Istio is no longer required for serverless
-    mode.\n       # By setting this field to true, user can use other networking layers
-    supported by knative.\n       # For more info https://github.com/kserve/kserve/pull/2380,
-    https://kserve.github.io/website/master/admin/serverless/kourier_networking/.\n
-    \      # NOTE: This configuration is only applicable to serverless deployment.\n
-    \      \"disableIstioVirtualHost\": false,\n\n       # disableIngressCreation
-    controls whether to disable ingress creation for raw deployment mode.\n       \"disableIngressCreation\":
-    false,\n \n       # pathTemplate specifies the template for generating path based
-    url for each inference service.\n       # The following variables can be used
-    in the template for generating url.\n       # Name of the inference service  (
-    {{ .Name}} )\n       # Namespace of the inference service ( {{ .Namespace }} )\n
-    \      # For more info https://github.com/kserve/kserve/issues/2257.\n       #
-    NOTE: This configuration only applicable to serverless deployment.\n       \"pathTemplate\":
-    \"/serving/{{ .Namespace }}/{{ .Name }}\"\n   }\n \n # ======================================
-    LOGGER CONFIGURATION ======================================\n # Example\n logger:
-    |-\n   {\n       \"image\" : \"kserve/agent:latest\",\n       \"memoryRequest\":
-    \"100Mi\",\n       \"memoryLimit\": \"1Gi\",\n       \"cpuRequest\": \"100m\",\n
-    \      \"cpuLimit\": \"1\",\n       \"defaultUrl\": \"http://default-broker\"\n
-    \  }\n logger: |-\n   {\n       # image contains the default logger image uri.\n
-    \      \"image\" : \"kserve/agent:latest\",\n   \n       # memoryRequest is the
-    requests.memory to set for the logger container.\n       \"memoryRequest\": \"100Mi\",\n
-    \      \n       # memoryLimit is the limits.memory to set for the logger container.\n
-    \      \"memoryLimit\": \"1Gi\",\n       \n       # cpuRequest is the requests.cpu
-    to set for the logger container.\n       \"cpuRequest\": \"100m\",\n       \n
-    \      # cpuLimit is the limits.cpu to set for the logger container.\n       \"cpuLimit\":
-    \"1\",\n       \n       # defaultUrl specifies the default logger url. If logger
-    is not specified in the resource this url is used.\n       \"defaultUrl\": \"http://default-broker\"\n
-    \  }\n \n # ====================================== BATCHER CONFIGURATION ======================================\n
-    # Example\n batcher: |-\n   {\n       \"image\" : \"kserve/agent:latest\",\n       \"memoryRequest\":
-    \"1Gi\",\n       \"memoryLimit\": \"1Gi\",\n       \"cpuRequest\": \"1\",\n       \"cpuLimit\":
-    \"1\",\n       \"maxBatchSize\": \"32\",\n       \"maxLatency\": \"5000\"\n   }\n
-    batcher: |-\n   {\n       # image contains the default batcher image uri.\n       \"image\"
-    : \"kserve/agent:latest\",\n       \n       # memoryRequest is the requests.memory
-    to set for the batcher container.\n       \"memoryRequest\": \"1Gi\",\n   \n       #
-    memoryLimit is the limits.memory to set for the batcher container.\n       \"memoryLimit\":
-    \"1Gi\",\n       \n       # cpuRequest is the requests.cpu to set for the batcher
-    container.\n       \"cpuRequest\": \"1\",\n       \n       # cpuLimit is the limits.cpu
-    to set for the batcher container.\n       \"cpuLimit\": \"1\"\n\n       # maxBatchSize
-    is the default maximum batch size for batcher.\n       \"maxBatchSize\": \"32\",\n\n
-    \      # maxLatency is the default maximum latency in milliseconds for batcher
-    to wait and collect the batch.\n       \"maxLatency\": \"5000\"\n   }\n \n # ======================================
-    AGENT CONFIGURATION ======================================\n # Example\n agent:
-    |-\n   {\n       \"image\" : \"kserve/agent:latest\",\n       \"memoryRequest\":
-    \"100Mi\",\n       \"memoryLimit\": \"1Gi\",\n       \"cpuRequest\": \"100m\",\n
-    \      \"cpuLimit\": \"1\"\n   }\n agent: |-\n   {\n       # image contains the
-    default agent image uri.\n       \"image\" : \"kserve/agent:latest\",\n   \n       #
-    memoryRequest is the requests.memory to set for the agent container.\n       \"memoryRequest\":
-    \"100Mi\",\n   \n       # memoryLimit is the limits.memory to set for the agent
-    container.\n       \"memoryLimit\": \"1Gi\",\n       \n       # cpuRequest is
-    the requests.cpu to set for the agent container.\n       \"cpuRequest\": \"100m\",\n
-    \      \n       # cpuLimit is the limits.cpu to set for the agent container.\n
-    \      \"cpuLimit\": \"1\"\n   }\n \n # ======================================
-    ROUTER CONFIGURATION ======================================\n # Example\n router:
-    |-\n   {\n       \"image\" : \"kserve/router:latest\",\n       \"memoryRequest\":
-    \"100Mi\",\n       \"memoryLimit\": \"1Gi\",\n       \"cpuRequest\": \"100m\",\n
-    \      \"cpuLimit\": \"1\",\n       \"headers\": {\n         \"propagate\": []\n
-    \      },\n       \"imagePullPolicy\": \"IfNotPresent\",\n       \"imagePullSecrets\":
-    [\"docker-secret\"]\n   }\n # router is the implementation of inference graph.\n
-    router: |-\n   {\n       # image contains the default router image uri.\n       \"image\"
-    : \"kserve/router:latest\",\n       \n       # memoryRequest is the requests.memory
-    to set for the router container.\n       \"memoryRequest\": \"100Mi\",\n       \n
-    \      # memoryLimit is the limits.memory to set for the router container.\n       \"memoryLimit\":
-    \"1Gi\",\n       \n       # cpuRequest is the requests.cpu to set for the router
-    container.\n       \"cpuRequest\": \"100m\",\n       \n       # cpuLimit is the
-    limits.cpu to set for the router container.\n       \"cpuLimit\": \"1\",\n       \n
-    \      # Propagate the specified headers to all the steps specified in an InferenceGraph.
-    \n       # You can either specify the exact header names or use [Golang supported
-    regex patterns]\n       # (https://pkg.go.dev/regexp/syntax@go1.21.3#hdr-Syntax)
-    to propagate multiple headers.\n       \"headers\": {\n         \"propagate\":
-    [\n            \"Authorization\",\n            \"Test-Header-*\",\n            \"*Trace-Id*\"\n
-    \        ]\n       }\n\n       # imagePullPolicy specifies when the router image
-    should be pulled from registry.\n       \"imagePullPolicy\": \"IfNotPresent\",\n
-    \      \n       # # imagePullSecrets specifies the list of secrets to be used
-    for pulling the router image from registry.\n       # https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/\n
-    \      \"imagePullSecrets\": [\"docker-secret\"]\n   }\n \n# ======================================
-    DEPLOYMENT CONFIGURATION ======================================\n# Example\ndeploy:
-    |-\n  {\n    \"defaultDeploymentMode\": \"Serverless\",\n    \"deploymentRolloutStrategy\":
-    {\n      \"defaultRollout\": {\n        \"maxSurge\": \"1\",\n        \"maxUnavailable\":
-    \"1\"\n      }\n    }\n  }\n\ndeploy: |-\n  {\n    # defaultDeploymentMode specifies
-    the default deployment mode of the kserve. The supported values are\n    # Standard
-    and Knative. Users can override the deployment mode at service level\n    # by
-    adding the annotation serving.kserve.io/deploymentMode.\n    # \"defaultDeploymentMode\":
-    \"Standard\",\n    # deploymentRolloutStrategy specifies the default rollout strategy
-    for the Standard deployment mode\n    # \"deploymentRolloutStrategy\": {\n      #
-    defaultRollout specifies the default rollout configuration using Kubernetes deployment
-    strategy\n      # \"defaultRollout\": {\n        # maxSurge specifies the maximum
-    number of pods that can be created above the desired replica count\n        #
-    Can be an absolute number (ex: 5) or a percentage of desired pods (ex: 10%)\n
-    \       # \"maxSurge\": \"1\",\n        # maxUnavailable specifies the maximum
-    number of pods that can be unavailable during the update\n        # Can be an
-    absolute number (ex: 5) or a percentage of desired pods (ex: 10%)\n        # \"maxUnavailable\":
-    \"1\"\n      # }\n    # }\n  }\n\n # ====================================== SERVICE
-    CONFIGURATION ======================================\n # Example\n service: |-\n
-    \  {\n     \"serviceClusterIPNone\":  false\n   }\n service: |-\n   {\n      #
-    ServiceClusterIPNone is a boolean flag to indicate if the service should have
-    a clusterIP set to None.\n      # If the DeploymentMode is Raw, the default value
-    for ServiceClusterIPNone if not set is false\n      # \"serviceClusterIPNone\":
-    \ false\n   }\n\n # ====================================== METRICS CONFIGURATION
-    ======================================\n # Example\n metricsAggregator: |-\n   {\n
-    \    \"enableMetricAggregation\": \"false\",\n     \"enablePrometheusScraping\"
-    : \"false\"\n   }\n # For more info see https://github.com/kserve/kserve/blob/master/qpext/README.md\n
-    metricsAggregator: |-\n   {\n     # enableMetricAggregation configures metric
-    aggregation annotation. This adds the annotation serving.kserve.io/enable-metric-aggregation
-    to every\n     # service with the specified boolean value. If true enables metric
-    aggregation in queue-proxy by setting env vars in the queue proxy container\n
-    \    # to configure scraping ports.\n     \"enableMetricAggregation\": \"false\",\n
-    \    \n     # enablePrometheusScraping configures metric aggregation annotation.
-    This adds the annotation serving.kserve.io/enable-metric-aggregation to every\n
-    \    # service with the specified boolean value. If true, prometheus annotations
-    are added to the pod. If serving.kserve.io/enable-metric-aggregation is false,\n
-    \    # the prometheus port is set with the default prometheus scraping port 9090,
-    otherwise the prometheus port annotation is set with the metric aggregation port.\n
-    \    \"enablePrometheusScraping\" : \"false\"\n   }\n  \n # ======================================
-    LOCALMODEL CONFIGURATION ======================================\n # Example\n
-    localModel: |-\n   {\n     \"enabled\": false,\n     # jobNamespace specifies
-    the namespace where the download job will be created.\n     \"jobNamespace\":
-    \"kserve-localmodel-jobs\",\n     # defaultJobImage specifies the default image
-    used for the download job.\n     \"defaultJobImage\" : \"kserve/storage-initializer:latest\",\n
-    \    # Kubernetes modifies the filesystem group ID on the attached volume.\n     \"fsGroup\":
-    1000,\n     # TTL for the download job after it is finished.\n     \"jobTTLSecondsAfterFinished\":
-    3600,\n     # The frequency at which the local model agent reconciles the local
-    models\n     # This is to detect if models are missing from local disk\n     \"reconcilationFrequencyInSecs\":
-    60,\n     # This is to disable localmodel pv and pvc management for namespaces
-    without isvcs\n     \"disableVolumeManagement\": false\n   }"
+  _example: |-
+    ################################
+    #                              #
+    #    EXAMPLE CONFIGURATION     #
+    #                              #
+    ################################
+
+    # This block is not actually functional configuration,
+    # but serves to illustrate the available configuration
+    # options and document them in a way that is accessible
+    # to users that `kubectl edit` this config map.
+    #
+    # These sample configuration options may be copied out of
+    # this example block and unindented to be in the data block
+    # to actually change the configuration.
+
+    # ====================================== EXPLAINERS CONFIGURATION ======================================
+    # Example
+    explainers: |-
+      {
+          "art": {
+              "image" : "kserve/art-explainer",
+              "defaultImageVersion": "latest"
+          }
+      }
+    # Art Explainer runtime configuration
+     explainers: |-
+       {
+           # Art explainer runtime configuration
+           "art": {
+               # image contains the default Art explainer serving runtime image uri.
+               "image" : "kserve/art-explainer",
+
+               # defautltImageVersion contains the Art explainer serving runtime default image version.
+               "defaultImageVersion": "latest"
+           }
+       }
+    # ====================================== ISVC CONFIGURATION ======================================
+    # Example - setting custom annotation
+     inferenceService: |-
+       {
+         "serviceAnnotationDisallowedList": [
+            "my.custom.annotation/1"
+         ],
+         "serviceLabelDisallowedList": [
+            "my.custom.label.1"
+         ]
+       }
+    # Example - setting custom annotation
+    inferenceService: |-
+      {
+        # ServiceAnnotationDisallowedList is a list of annotations that are not allowed to be propagated to Knative
+        # revisions, which prevents the reconciliation loop to be triggered if the annotations is
+        # configured here are used.
+        # Default values are:
+        #  "autoscaling.knative.dev/min-scale",
+        #  "autoscaling.knative.dev/max-scale",
+        #  "internal.serving.kserve.io/storage-initializer-sourceuri",
+        #  "kubectl.kubernetes.io/last-applied-configuration",
+        #  "modelFormat"
+        # Any new value will be appended to the list.
+        "serviceAnnotationDisallowedList": [
+          "my.custom.annotation/1"
+        ],
+        # ServiceLabelDisallowedList is a list of labels that are not allowed to be propagated to Knative revisions
+        # which prevents the reconciliation loop to be triggered if the labels is configured here are used.
+        "serviceLabelDisallowedList": [
+          "my.custom.label.1"
+        ]
+      }
+    # Example - setting custom resource
+    inferenceService: |-
+      {
+        "resource": {
+          "cpuLimit": "1",
+          "memoryLimit": "2Gi",
+          "cpuRequest": "1",
+          "memoryRequest": "2Gi"
+        }
+      }
+    # Example - setting custom resource
+    inferenceService: |-
+      {
+        # resource contains the default resource configuration for the inference service.
+        # you can override this configuration by specifying the resources in the inference service yaml.
+        # If you want to unbound the resource (limits and requests), you can set the value to null or ""
+        # or just remove the specific field from the config.
+        "resource": {
+           # cpuLimit is the limits.cpu to set for the inference service.
+           "cpuLimit": "1",
+
+           # memoryLimit is the limits.memory to set for the inference service.
+           "memoryLimit": "2Gi",
+
+           # cpuRequest is the requests.cpu to set for the inference service.
+           "cpuRequest": "1",
+
+           # memoryRequest is the requests.memory to set for the inference service.
+           "memoryRequest": "2Gi"
+        }
+     }
+    # ====================================== MultiNode CONFIGURATION ======================================
+    # Example
+    multiNode: |-
+      {
+        "customGPUResourceTypeList": [
+          "custom.com/gpu"
+        ]
+      }
+    # Example of multinode configuration
+    multiNode: |-
+      {
+        # CustomGPUResourceTypeList is a list of custom GPU resource types intended to identify the GPU type of a resource,
+        # not to restrict the user from using a specific GPU type.
+        # The MultiNode runtime pod will dynamically add GPU resources based on the registered GPU types.
+        "customGPUResourceTypeList": [
+          "custom.com/gpu"
+        ]
+      }
+     # ====================================== OTelCollector CONFIGURATION ======================================
+     # Example
+     opentelemetryCollector: |-
+       {
+         # scrapeInterval is the interval at which the OpenTelemetry Collector will scrape the metrics.
+         "scrapeInterval": "5s",
+         # metricScalerEndpoint is the endpoint from which the KEDA's ScaledObject will scrape the metrics.
+         "metricScalerEndpoint": "keda-otel-scaler.keda.svc:4318",
+         # metricReceiverEndpoint is the endpoint from which the OpenTelemetry Collector will scrape the metrics.
+          "metricReceiverEndpoint": "keda-otel-scaler.keda.svc:4317"
+       }
+
+     # ====================================== AUTOSCALER CONFIGURATION ======================================
+     # Example
+     autoscaler: |-
+       {
+         # scaleUpStabilizationWindowSeconds is the stabilization window in seconds for scale up.
+         "scaleUpStabilizationWindowSeconds": "0",
+         # scaleDownStabilizationWindowSeconds is the stabilization window in seconds for scale down.
+         "scaleDownStabilizationWindowSeconds": "300"
+       }
+
+     # ====================================== STORAGE INITIALIZER CONFIGURATION ======================================
+     # Example
+     storageInitializer: |-
+       {
+           "image" : "kserve/storage-initializer:latest",
+           "memoryRequest": "100Mi",
+           "memoryLimit": "1Gi",
+           "cpuRequest": "100m",
+           "cpuLimit": "1",
+           "caBundleConfigMapName": "",
+           "caBundleVolumeMountPath": "/etc/ssl/custom-certs",
+           "enableModelcar": false,
+           "cpuModelcar": "10m",
+           "memoryModelcar": "15Mi"
+       }
+     storageInitializer: |-
+       {
+           # image contains the default storage initializer image uri.
+           "image" : "kserve/storage-initializer:latest",
+
+           # memoryRequest is the requests.memory to set for the storage initializer init container.
+           "memoryRequest": "100Mi",
+
+            # memoryLimit is the limits.memory to set for the storage initializer init container.
+           "memoryLimit": "1Gi",
+
+           # cpuRequest is the requests.cpu to set for the storage initializer init container.
+           "cpuRequest": "100m",
+
+           # cpuLimit is the limits.cpu to set for the storage initializer init container.
+           "cpuLimit": "1",
+
+           # caBundleConfigMapName is the ConfigMap will be copied to a user namespace for the storage initializer init container.
+           "caBundleConfigMapName": "",
+
+           # caBundleVolumeMountPath is the mount point for the configmap set by caBundleConfigMapName for the storage initializer init container.
+           "caBundleVolumeMountPath": "/etc/ssl/custom-certs",
+
+           # enableModelcar enabled allows you to directly access an OCI container image by
+           # using a source URL with an "oci://" schema.
+           "enableModelcar": false,
+
+           # cpuModelcar is the cpu request and limit that is used for the passive modelcar container. It can be
+           # set very low, but should be allowed by any Kubernetes LimitRange that might apply.
+           "cpuModelcar": "10m",
+
+           # cpuModelcar is the memory request and limit that is used for the passive modelcar container. It can be
+           # set very low, but should be allowed by any Kubernetes LimitRange that might apply.
+           "memoryModelcar": "15Mi",
+
+           # uidModelcar is the UID under with which the modelcar process and the main container is running.
+           # Some Kubernetes clusters might require this to be root (0). If not set the user id is left untouched (default)
+           "uidModelcar": 10
+       }
+
+     # ====================================== CREDENTIALS ======================================
+     # Example
+     credentials: |-
+       {
+          "storageSpecSecretName": "storage-config",
+          "storageSecretNameAnnotation": "serving.kserve.io/storageSecretName",
+          "gcs": {
+              "gcsCredentialFileName": "gcloud-application-credentials.json"
+          },
+          "s3": {
+              "s3AccessKeyIDName": "AWS_ACCESS_KEY_ID",
+              "s3SecretAccessKeyName": "AWS_SECRET_ACCESS_KEY",
+              "s3Endpoint": "",
+              "s3UseHttps": "",
+              "s3Region": "",
+              "s3VerifySSL": "",
+              "s3UseVirtualBucket": "",
+              "s3UseAccelerate": "",
+              "s3UseAnonymousCredential": "",
+              "s3CABundleConfigMap": "",
+              "s3CABundle": ""
+          }
+       }
+     # This is a global configuration used for downloading models from the cloud storage.
+     # You can override this configuration by specifying the annotations on service account or static secret.
+     # https://kserve.github.io/website/master/modelserving/storage/s3/s3/
+     # For a quick reference about AWS ENV variables:
+     # AWS Cli: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
+     # Boto: https://boto3.amazonaws.com/v1/documentation/api/latest/guide/configuration.html#using-environment-variables
+     #
+     # The `s3AccessKeyIDName` and `s3SecretAccessKeyName` fields are only used from this configmap when static credentials (IAM User Access Key Secret)
+     # are used as the authentication method for AWS S3.
+     # The rest of the fields are used in both authentication methods (IAM Role for Service Account & IAM User Access Key Secret) if a non-empty value is provided.
+     credentials: |-
+       {
+          # storageSpecSecretName contains the secret name which has the credentials for downloading the model.
+          # This option is used when specifying the storage spec on isvc yaml.
+          "storageSpecSecretName": "storage-config",
+
+          # The annotation can be specified on isvc yaml to allow overriding with the secret name reference from the annotation value.
+          # When using storageUri the order of the precedence is: secret name reference annotation > secret name references from service account
+          # When using storageSpec the order of the precedence is: secret name reference annotation > storageSpecSecretName in configmap
+
+          # Configuration for google cloud storage
+          "gcs": {
+              # gcsCredentialFileName specifies the filename of the gcs credential
+              "gcsCredentialFileName": "gcloud-application-credentials.json"
+          },
+
+          # Configuration for aws s3 storage. This add the corresponding environmental variables to the storage initializer init container.
+          # For more info on s3 storage see https://kserve.github.io/website/master/modelserving/storage/s3/s3/
+          "s3": {
+              # s3AccessKeyIDName specifies the s3 access key id name
+              "s3AccessKeyIDName": "AWS_ACCESS_KEY_ID",
+
+              # s3SecretAccessKeyName specifies the s3 secret access key name
+              "s3SecretAccessKeyName": "AWS_SECRET_ACCESS_KEY",
+
+              # s3Endpoint specifies the s3 endpoint
+              "s3Endpoint": "",
+
+              # s3UseHttps controls whether to use secure https or unsecure http to download models.
+              # Allowed values are 0 and 1.
+              "s3UseHttps": "",
+
+              # s3Region specifies the region of the bucket.
+              "s3Region": "",
+
+              # s3VerifySSL controls whether to verify the tls/ssl certificate.
+              "s3VerifySSL": "",
+
+              # s3UseVirtualBucket configures whether it is a virtual bucket or not.
+              "s3UseVirtualBucket": "",
+
+              # s3UseAccelerate configures whether to use transfer acceleration.
+              "s3UseAccelerate": "",
+
+              # s3UseAnonymousCredential configures whether to use anonymous credentials to download the model or not.
+              "s3UseAnonymousCredential": "",
+
+              # s3CABundleConfigMap specifies the mounted CA bundle config map name.
+              "s3CABundleConfigMap": "",
+
+              # s3CABundle specifies the full path (mount path + file name) for the mounted config map data when used with a configured CA bundle config map.
+              # s3CABundle specifies the path to a certificate bundle to use for HTTPS certificate validation when used absent of a configured CA bundle config map.
+              "s3CABundle": ""
+          }
+       }
+
+     # ====================================== INGRESS CONFIGURATION ======================================
+     # Example
+     ingress: |-
+       {
+           "enableGatewayApi": false,
+           "kserveIngressGateway": "kserve/kserve-ingress-gateway",
+           "ingressGateway" : "knative-serving/knative-ingress-gateway",
+           "localGateway" : "knative-serving/knative-local-gateway",
+           "localGatewayService" : "knative-local-gateway.istio-system.svc.cluster.local",
+           "ingressDomain"  : "example.com",
+           "additionalIngressDomains": ["additional-example.com", "additional-example-1.com"],
+           "ingressClassName" : "istio",
+           "domainTemplate": "{{ .Name }}-{{ .Namespace }}.{{ .IngressDomain }}",
+           "urlScheme": "http",
+           "disableIstioVirtualHost": false,
+           "disableIngressCreation": false,
+           "disableHTTPRouteTimeout": false
+       }
+     ingress: |-
+       {
+           # enableGatewayApi specifies whether to use Gateway API instead of Ingress to serve external traffic.
+           "enableGatewayApi": false,
+
+           # KServe implements [Gateway API](https://gateway-api.sigs.k8s.io/) to serve external traffic.
+           # By default, KServe configures a default gateway to serve external traffic.
+           # But, KServe can be configured to use a custom gateway by modifying this configuration.
+           # The gateway should be specified in format <gateway namespace>/<gateway name>
+           # NOTE: This configuration only applicable for raw deployment.
+           "kserveIngressGateway": "kserve/kserve-ingress-gateway",
+
+           # ingressGateway specifies the ingress gateway to serve external traffic.
+           # The gateway should be specified in format <gateway namespace>/<gateway name>
+           # NOTE: This configuration only applicable for serverless deployment with Istio configured as network layer.
+           "ingressGateway" : "knative-serving/knative-ingress-gateway",
+
+           # knativeLocalGatewayService specifies the hostname of the Knative's local gateway service.
+           # The default KServe configurations are re-using the Istio local gateways for Knative. In this case, this
+           # knativeLocalGatewayService field can be left unset. When unset, the value of "localGatewayService" will be used.
+           # However, sometimes it may be better to have local gateways specifically for KServe (e.g. when enabling strict mTLS in Istio).
+           # Under such setups where KServe is needed to have its own local gateways, the values of the "localGateway" and
+           # "localGatewayService" should point to the KServe local gateways. Then, this knativeLocalGatewayService field
+           # should point to the Knative's local gateway service.
+           # NOTE: This configuration only applicable for serverless deployment with Istio configured as network layer.
+           "knativeLocalGatewayService": "",
+
+           # localGateway specifies the gateway which handles the network traffic within the cluster.
+           # NOTE: This configuration only applicable for serverless deployment with Istio configured as network layer.
+           "localGateway" : "knative-serving/knative-local-gateway",
+
+           # localGatewayService specifies the hostname of the local gateway service.
+           # NOTE: This configuration only applicable for serverless deployment with Istio configured as network layer.
+           "localGatewayService" : "knative-local-gateway.istio-system.svc.cluster.local",
+
+           # ingressDomain specifies the domain name which is used for creating the url.
+           # If ingressDomain is empty then example.com is used as default domain.
+           # NOTE: This configuration only applicable for raw deployment.
+           "ingressDomain"  : "example.com",
+
+           # additionalIngressDomains specifies the additional domain names which are used for creating the url.
+           "additionalIngressDomains": ["additional-example.com", "additional-example-1.com"]
+
+           # ingressClassName specifies the ingress controller to use for ingress traffic.
+           # This is optional and if omitted the default ingress in the cluster is used.
+           # https://kubernetes.io/docs/concepts/services-networking/ingress/#default-ingress-class
+           # NOTE: This configuration only applicable for raw deployment.
+           "ingressClassName" : "istio",
+
+           # domainTemplate specifies the template for generating domain/url for each inference service by combining variable from:
+           # Name of the inference service  ( {{ .Name}} )
+           # Namespace of the inference service ( {{ .Namespace }} )
+           # Annotation of the inference service ( {{ .Annotations.key }} )
+           # Label of the inference service ( {{ .Labels.key }} )
+           # IngressDomain ( {{ .IngressDomain }} )
+           # If domain template is empty the default template {{ .Name }}-{{ .Namespace }}.{{ .IngressDomain }} is used.
+           # NOTE: This configuration only applicable for raw deployment.
+           "domainTemplate": "{{ .Name }}-{{ .Namespace }}.{{ .IngressDomain }}",
+
+           # urlScheme specifies the url scheme to use for inference service and inference graph.
+           # If urlScheme is empty then by default http is used.
+           "urlScheme": "http",
+
+           # disableIstioVirtualHost controls whether to use istio as network layer.
+           # By default istio is used as the network layer. When DisableIstioVirtualHost is true, KServe does not
+           # create the top level virtual service thus Istio is no longer required for serverless mode.
+           # By setting this field to true, user can use other networking layers supported by knative.
+           # For more info https://github.com/kserve/kserve/pull/2380, https://kserve.github.io/website/master/admin/serverless/kourier_networking/.
+           # NOTE: This configuration is only applicable to serverless deployment.
+           "disableIstioVirtualHost": false,
+
+           # disableIngressCreation controls whether to disable ingress creation for raw deployment mode.
+           "disableIngressCreation": false,
+
+           # disableHTTPRouteTimeout controls whether to omit the timeout field from HTTPRoute rules.
+           # Set to true for Gateway controllers (e.g. GKE Gateway) that do not support the optional timeouts field.
+           "disableHTTPRouteTimeout": false,
+
+           # pathTemplate specifies the template for generating path based url for each inference service.
+           # The following variables can be used in the template for generating url.
+           # Name of the inference service  ( {{ .Name}} )
+           # Namespace of the inference service ( {{ .Namespace }} )
+           # For more info https://github.com/kserve/kserve/issues/2257.
+           # NOTE: This configuration only applicable to serverless deployment.
+           "pathTemplate": "/serving/{{ .Namespace }}/{{ .Name }}"
+       }
+
+     # ====================================== LOGGER CONFIGURATION ======================================
+     # Example
+     logger: |-
+       {
+           "image" : "kserve/agent:latest",
+           "memoryRequest": "100Mi",
+           "memoryLimit": "1Gi",
+           "cpuRequest": "100m",
+           "cpuLimit": "1",
+           "defaultUrl": "http://default-broker"
+       }
+     logger: |-
+       {
+           # image contains the default logger image uri.
+           "image" : "kserve/agent:latest",
+
+           # memoryRequest is the requests.memory to set for the logger container.
+           "memoryRequest": "100Mi",
+
+           # memoryLimit is the limits.memory to set for the logger container.
+           "memoryLimit": "1Gi",
+
+           # cpuRequest is the requests.cpu to set for the logger container.
+           "cpuRequest": "100m",
+
+           # cpuLimit is the limits.cpu to set for the logger container.
+           "cpuLimit": "1",
+
+           # defaultUrl specifies the default logger url. If logger is not specified in the resource this url is used.
+           "defaultUrl": "http://default-broker"
+       }
+
+     # ====================================== BATCHER CONFIGURATION ======================================
+     # Example
+     batcher: |-
+       {
+           "image" : "kserve/agent:latest",
+           "memoryRequest": "1Gi",
+           "memoryLimit": "1Gi",
+           "cpuRequest": "1",
+           "cpuLimit": "1",
+           "maxBatchSize": "32",
+           "maxLatency": "5000"
+       }
+     batcher: |-
+       {
+           # image contains the default batcher image uri.
+           "image" : "kserve/agent:latest",
+
+           # memoryRequest is the requests.memory to set for the batcher container.
+           "memoryRequest": "1Gi",
+
+           # memoryLimit is the limits.memory to set for the batcher container.
+           "memoryLimit": "1Gi",
+
+           # cpuRequest is the requests.cpu to set for the batcher container.
+           "cpuRequest": "1",
+
+           # cpuLimit is the limits.cpu to set for the batcher container.
+           "cpuLimit": "1"
+
+           # maxBatchSize is the default maximum batch size for batcher.
+           "maxBatchSize": "32",
+
+           # maxLatency is the default maximum latency in milliseconds for batcher to wait and collect the batch.
+           "maxLatency": "5000"
+       }
+
+     # ====================================== AGENT CONFIGURATION ======================================
+     # Example
+     agent: |-
+       {
+           "image" : "kserve/agent:latest",
+           "memoryRequest": "100Mi",
+           "memoryLimit": "1Gi",
+           "cpuRequest": "100m",
+           "cpuLimit": "1"
+       }
+     agent: |-
+       {
+           # image contains the default agent image uri.
+           "image" : "kserve/agent:latest",
+
+           # memoryRequest is the requests.memory to set for the agent container.
+           "memoryRequest": "100Mi",
+
+           # memoryLimit is the limits.memory to set for the agent container.
+           "memoryLimit": "1Gi",
+
+           # cpuRequest is the requests.cpu to set for the agent container.
+           "cpuRequest": "100m",
+
+           # cpuLimit is the limits.cpu to set for the agent container.
+           "cpuLimit": "1"
+       }
+
+     # ====================================== ROUTER CONFIGURATION ======================================
+     # Example
+     router: |-
+       {
+           "image" : "kserve/router:latest",
+           "memoryRequest": "100Mi",
+           "memoryLimit": "1Gi",
+           "cpuRequest": "100m",
+           "cpuLimit": "1",
+           "headers": {
+             "propagate": []
+           },
+           "imagePullPolicy": "IfNotPresent",
+           "imagePullSecrets": ["docker-secret"]
+       }
+     # router is the implementation of inference graph.
+     router: |-
+       {
+           # image contains the default router image uri.
+           "image" : "kserve/router:latest",
+
+           # memoryRequest is the requests.memory to set for the router container.
+           "memoryRequest": "100Mi",
+
+           # memoryLimit is the limits.memory to set for the router container.
+           "memoryLimit": "1Gi",
+
+           # cpuRequest is the requests.cpu to set for the router container.
+           "cpuRequest": "100m",
+
+           # cpuLimit is the limits.cpu to set for the router container.
+           "cpuLimit": "1",
+
+           # Propagate the specified headers to all the steps specified in an InferenceGraph.
+           # You can either specify the exact header names or use [Golang supported regex patterns]
+           # (https://pkg.go.dev/regexp/syntax@go1.21.3#hdr-Syntax) to propagate multiple headers.
+           "headers": {
+             "propagate": [
+                "Authorization",
+                "Test-Header-*",
+                "*Trace-Id*"
+             ]
+           }
+
+           # imagePullPolicy specifies when the router image should be pulled from registry.
+           "imagePullPolicy": "IfNotPresent",
+
+           # # imagePullSecrets specifies the list of secrets to be used for pulling the router image from registry.
+           # https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+           "imagePullSecrets": ["docker-secret"]
+       }
+
+    # ====================================== DEPLOYMENT CONFIGURATION ======================================
+    # Example
+    deploy: |-
+      {
+        "defaultDeploymentMode": "Serverless",
+        "deploymentRolloutStrategy": {
+          "defaultRollout": {
+            "maxSurge": "1",
+            "maxUnavailable": "1"
+          }
+        }
+      }
+
+    deploy: |-
+      {
+        # defaultDeploymentMode specifies the default deployment mode of the kserve. The supported values are
+        # Standard and Knative. Users can override the deployment mode at service level
+        # by adding the annotation serving.kserve.io/deploymentMode.
+        # "defaultDeploymentMode": "Standard",
+        # deploymentRolloutStrategy specifies the default rollout strategy for the Standard deployment mode
+        # "deploymentRolloutStrategy": {
+          # defaultRollout specifies the default rollout configuration using Kubernetes deployment strategy
+          # "defaultRollout": {
+            # maxSurge specifies the maximum number of pods that can be created above the desired replica count
+            # Can be an absolute number (ex: 5) or a percentage of desired pods (ex: 10%)
+            # "maxSurge": "1",
+            # maxUnavailable specifies the maximum number of pods that can be unavailable during the update
+            # Can be an absolute number (ex: 5) or a percentage of desired pods (ex: 10%)
+            # "maxUnavailable": "1"
+          # }
+        # }
+      }
+
+     # ====================================== SERVICE CONFIGURATION ======================================
+     # Example
+     service: |-
+       {
+         "serviceClusterIPNone":  false
+       }
+     service: |-
+       {
+          # ServiceClusterIPNone is a boolean flag to indicate if the service should have a clusterIP set to None.
+          # If the DeploymentMode is Raw, the default value for ServiceClusterIPNone if not set is false
+          # "serviceClusterIPNone":  false
+       }
+
+     # ====================================== METRICS CONFIGURATION ======================================
+     # Example
+     metricsAggregator: |-
+       {
+         "enableMetricAggregation": "false",
+         "enablePrometheusScraping" : "false"
+       }
+     # For more info see https://github.com/kserve/kserve/blob/master/qpext/README.md
+     metricsAggregator: |-
+       {
+         # enableMetricAggregation configures metric aggregation annotation. This adds the annotation serving.kserve.io/enable-metric-aggregation to every
+         # service with the specified boolean value. If true enables metric aggregation in queue-proxy by setting env vars in the queue proxy container
+         # to configure scraping ports.
+         "enableMetricAggregation": "false",
+
+         # enablePrometheusScraping configures metric aggregation annotation. This adds the annotation serving.kserve.io/enable-metric-aggregation to every
+         # service with the specified boolean value. If true, prometheus annotations are added to the pod. If serving.kserve.io/enable-metric-aggregation is false,
+         # the prometheus port is set with the default prometheus scraping port 9090, otherwise the prometheus port annotation is set with the metric aggregation port.
+         "enablePrometheusScraping" : "false"
+       }
+
+     # ====================================== LOCALMODEL CONFIGURATION ======================================
+     # Example
+     localModel: |-
+       {
+         "enabled": false,
+         # jobNamespace specifies the namespace where the download job will be created.
+         "jobNamespace": "kserve-localmodel-jobs",
+         # defaultJobImage specifies the default image used for the download job.
+         "defaultJobImage" : "kserve/storage-initializer:latest",
+         # Kubernetes modifies the filesystem group ID on the attached volume.
+         "fsGroup": 1000,
+         # TTL for the download job after it is finished.
+         "jobTTLSecondsAfterFinished": 3600,
+         # The frequency at which the local model agent reconciles the local models
+         # This is to detect if models are missing from local disk
+         "reconcilationFrequencyInSecs": 60,
+         # This is to disable localmodel pv and pvc management for namespaces without isvcs
+         "disableVolumeManagement": false
+       }
   agent: |-
     {
         "image" : "kserve/agent:latest",
@@ -90434,13 +91865,21 @@ data:
           "memoryRequest": "2Gi"
         }
     }
-  ingress: "{   \n    \"enableGatewayApi\": false,\n    \"kserveIngressGateway\":
-    \"kserve/kserve-ingress-gateway\",\n    \"ingressGateway\" : \"knative-serving/knative-ingress-gateway\",\n
-    \   \"localGateway\" : \"knative-serving/knative-local-gateway\",\n    \"localGatewayService\"
-    : \"knative-local-gateway.istio-system.svc.cluster.local\",\n    \"ingressDomain\"
-    \ : \"example.com\",\n    \"ingressClassName\" : \"istio\",\n    \"domainTemplate\":
-    \"{{ .Name }}-{{ .Namespace }}.{{ .IngressDomain }}\",\n    \"urlScheme\": \"http\",\n
-    \   \"disableIstioVirtualHost\": false,\n    \"disableIngressCreation\": false\n}"
+  ingress: |-
+    {
+        "enableGatewayApi": false,
+        "kserveIngressGateway": "kserve/kserve-ingress-gateway",
+        "ingressGateway" : "knative-serving/knative-ingress-gateway",
+        "localGateway" : "knative-serving/knative-local-gateway",
+        "localGatewayService" : "knative-local-gateway.istio-system.svc.cluster.local",
+        "ingressDomain"  : "example.com",
+        "ingressClassName" : "istio",
+        "domainTemplate": "{{ .Name }}-{{ .Namespace }}.{{ .IngressDomain }}",
+        "urlScheme": "http",
+        "disableIstioVirtualHost": false,
+        "disableIngressCreation": false,
+        "disableHTTPRouteTimeout": false
+    }
   localModel: |-
     {
       "enabled": false,
@@ -90685,7 +92124,61 @@ spec:
   - regex: https://(.+?).blob.core.windows.net/(.+)
   - regex: https://(.+?).file.core.windows.net/(.+)
   - regex: https?://(.+)/(.+)
+  supportsMultiModelDownload: true
   workloadType: initContainer
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  annotations:
+    cert-manager.io/inject-ca-from: kserve/llmisvc-serving-cert
+  creationTimestamp: null
+  name: llminferenceservice.serving.kserve.io
+webhooks:
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: llmisvc-webhook-server-service
+      namespace: kserve
+      path: /mutate-serving-kserve-io-v1alpha1-llminferenceservice
+  failurePolicy: Fail
+  matchPolicy: Exact
+  name: llminferenceservice.kserve-webhook-server.v1alpha1.defaulter
+  rules:
+  - apiGroups:
+    - serving.kserve.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - llminferenceservices
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: llmisvc-webhook-server-service
+      namespace: kserve
+      path: /mutate-serving-kserve-io-v1alpha2-llminferenceservice
+  failurePolicy: Fail
+  matchPolicy: Exact
+  name: llminferenceservice.kserve-webhook-server.v1alpha2.defaulter
+  rules:
+  - apiGroups:
+    - serving.kserve.io
+    apiVersions:
+    - v1alpha2
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - llminferenceservices
+  sideEffects: None
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
