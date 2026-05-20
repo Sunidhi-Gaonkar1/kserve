@@ -5,7 +5,9 @@ ARG VENV_PATH=/prod_venv
 FROM ${BASE_IMAGE} AS builder
 
 # Required for building packages for arm64 arch
-RUN apt-get update && apt-get install -y --no-install-recommends curl python3-dev build-essential && apt-get clean && \
+RUN apt-get update && apt-get install -y --no-install-recommends curl python3-dev build-essential && \
+    if [ "$(uname -m)" = "ppc64le" ]; then apt-get install pkg-config libssl-dev gcc gfortran cmake pkg-config libssl-dev libopenblas-dev libjpeg-dev libhdf5-dev wget -y; fi && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -23,17 +25,17 @@ COPY storage/pyproject.toml storage/uv.lock storage/
 
 # ------------------ kserve deps ------------------
 COPY kserve/pyproject.toml kserve/uv.lock kserve/
-RUN cd kserve && uv sync --active --no-cache
+RUN cd kserve && uv lock --upgrade && uv sync --active --no-cache
 
 COPY kserve kserve
-RUN cd kserve && uv sync --active --no-cache
+RUN cd kserve && uv lock --upgrade && uv sync --active --no-cache
 
 # ------------------ artexplainer deps ------------------
 COPY artexplainer/pyproject.toml artexplainer/uv.lock artexplainer/
-RUN cd artexplainer && uv sync --active --no-cache
+RUN cd artexplainer && uv lock --upgrade && uv sync --active --no-cache
 
 COPY artexplainer artexplainer
-RUN cd artexplainer && uv sync --active --no-cache
+RUN cd artexplainer && uv lock --upgrade && uv sync --active --no-cache
 
 # Generate third-party licenses
 COPY pyproject.toml pyproject.toml
