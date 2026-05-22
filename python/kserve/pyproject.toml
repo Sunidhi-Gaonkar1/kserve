@@ -152,4 +152,23 @@ uvloop = [
     { index = "pypi", marker = "platform_machine != 'ppc64le'" },
     { index = "power-wheels", marker = "platform_machine == 'ppc64le'" },
 ]
-
+scipy = [
+    { index = "pypi", marker = "platform_machine != 'ppc64le'" },
+    { index = "power-wheels", marker = "platform_machine == 'ppc64le'" },
+]
+scikit-learn = [
+    { index = "pypi", marker = "platform_machine != 'ppc64le'" },
+    { index = "power-wheels", marker = "platform_machine == 'ppc64le'" },
+]
+pillow = [
+    { index = "pypi", marker = "platform_machine != 'ppc64le'" },
+    { index = "power-wheels", marker = "platform_machine == 'ppc64le'" },
+]
+h5py = [
+    { index = "pypi", marker = "platform_machine != 'ppc64le'" },
+    { index = "power-wheels", marker = "platform_machine == 'ppc64le'" },
+]
+ml-dtypes = [
+    { index = "pypi", marker = "platform_machine != 'ppc64le'" },
+    { index = "power-wheels", marker = "platform_machine == 'ppc64le'" },
+]
