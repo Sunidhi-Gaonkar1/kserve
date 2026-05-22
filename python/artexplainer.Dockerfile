@@ -25,17 +25,17 @@ COPY storage/pyproject.toml storage/uv.lock storage/
 
 # ------------------ kserve deps ------------------
 COPY kserve/pyproject.toml kserve/uv.lock kserve/
-RUN cd kserve && uv lock --upgrade && uv sync --active --no-cache
+RUN cd kserve && uv sync --active --no-cache
 
 COPY kserve kserve
-RUN cd kserve && uv lock --upgrade && uv sync --active --no-cache
+RUN cd kserve && uv sync --active --no-cache
 
 # ------------------ artexplainer deps ------------------
 COPY artexplainer/pyproject.toml artexplainer/uv.lock artexplainer/
-RUN cd artexplainer && uv lock --upgrade && uv sync --active --no-cache
+RUN cd artexplainer && uv sync --active --no-cache
 
 COPY artexplainer artexplainer
-RUN cd artexplainer && uv lock --upgrade && uv sync --active --no-cache
+RUN cd artexplainer && uv sync --active --no-cache
 
 # Generate third-party licenses
 COPY pyproject.toml pyproject.toml
