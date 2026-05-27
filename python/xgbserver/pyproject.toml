@@ -30,3 +30,19 @@ dev = [
 override-dependencies = [
   "nvidia-nccl-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"
 ]
+index-strategy = "unsafe-best-match"
+
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "ppc64le-wheels"
+url = "https://wheels.developerfirst.ibm.com/ppc64le/linux"
+
+scipy = [
+    { index = "pypi", marker = "platform_machine != 'ppc64le'" },
+    { index = "ppc64le-wheels", marker = "platform_machine == 'ppc64le'" },
+]
