@@ -4,9 +4,10 @@ ARG VENV_PATH=/prod_venv
 
 FROM ${BASE_IMAGE} AS builder
 
-# Required for building packages for arm64 arch
+# Required for building packages for arm64/ppc64le arch
 RUN apt-get update && apt-get install -y --no-install-recommends curl python3-dev build-essential && \
-    if [ "$(uname -m)" = "ppc64le" ]; then apt-get install pkg-config libssl-dev gcc gfortran cmake pkg-config libssl-dev libopenblas-dev libjpeg-dev libhdf5-dev wget -y; fi && \
+    if [ "$(uname -m)" = "ppc64le" ]; then apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev gcc gfortran cmake libopenblas-dev libjpeg-dev libhdf5-dev wget; fi && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -48,6 +49,9 @@ RUN if [ "$(uname -m)" = "ppc64le" ]; then \
             -e '/^kserve-storage\s*=.*/a uvloop = { index = "ppc64le-wheels" }' \
             -e '/^kserve-storage\s*=.*/a pillow = { index = "ppc64le-wheels" }' \
             kserve/pyproject.toml && \
+        echo "===== kserve/pyproject.toml after ppc64le patch =====" && \
+        cat kserve/pyproject.toml && \
+        echo "===== end of kserve/pyproject.toml =====" && \
         cd kserve && uv lock && \
         cp uv.lock /tmp/kserve_ppc64le_uv.lock && \
         cp pyproject.toml /tmp/kserve_ppc64le_pyproject.toml; \
