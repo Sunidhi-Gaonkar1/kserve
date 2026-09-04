@@ -31,14 +31,14 @@ COPY kserve/pyproject.toml kserve/uv.lock kserve/
 # then regenerate uv.lock before syncing.
 RUN if [ "$(uname -m)" = "ppc64le" ]; then \
         sed -i \
-            -e '/^index-strategy\s*=.*/a \\' \
-            -e '/^index-strategy\s*=.*/a [[tool.uv.index]]' \
-            -e '/^index-strategy\s*=.*/a name = "ppc64le-wheels"' \
-            -e '/^index-strategy\s*=.*/a url = "https://wheels.developerfirst.ibm.com/ppc64le/linux"' \
-            -e '/^index-strategy\s*=.*/a explicit = true' \
-            -e '/^\s*"pyasn1>=[^,]*"$/s/"$/",/' \
-            -e '/^\s*"pyasn1>=/a\    "httptools==0.6.4",' \
-            -e '/^\s*"pyasn1>=/a\    "uvloop==0.21.0",' \
+            -e '/^\[build-system\]/i \\' \
+            -e '/^\[build-system\]/i [[tool.uv.index]]' \
+            -e '/^\[build-system\]/i name = "ppc64le-wheels"' \
+            -e '/^\[build-system\]/i url = "https://wheels.developerfirst.ibm.com/ppc64le/linux"' \
+            -e '/^\[build-system\]/i explicit = true' \
+            -e '/^\[build-system\]/i \\' \
+            -e '/^\s*"pillow>=/a\    "httptools==0.6.4",' \
+            -e '/^\s*"pillow>=/a\    "uvloop==0.21.0",' \
             -e '/^kserve-storage\s*=.*/a grpcio = { index = "ppc64le-wheels" }' \
             -e '/^kserve-storage\s*=.*/a grpcio-tools = { index = "ppc64le-wheels" }' \
             -e '/^kserve-storage\s*=.*/a numpy = { index = "ppc64le-wheels" }' \
@@ -53,6 +53,9 @@ RUN if [ "$(uname -m)" = "ppc64le" ]; then \
         cat kserve/pyproject.toml && \
         echo "===== end of kserve/pyproject.toml =====" && \
         cd kserve && uv lock && \
+        echo "===== kserve/uv.lock after ppc64le patch =====" && \
+        cat uv.lock && \
+        echo "===== end of kserve/uv.lock =====" && \
         cp uv.lock /tmp/kserve_ppc64le_uv.lock && \
         cp pyproject.toml /tmp/kserve_ppc64le_pyproject.toml; \
     fi

@@ -676,7 +676,7 @@ RUN if [ "$(uname -m)" = "ppc64le" ]; then \
 
 | # | Issue | Severity | File | Fix Needed |
 |---|-------|----------|------|------------|
-| 1 | TOML structure broken — CVE pins silently dropped | 🔴 CRITICAL | `artexplainer.Dockerfile:33` | Move `[[tool.uv.index]]` insertion to after `[build-system]` anchor |
+| 1 | ~~TOML structure broken — CVE pins silently dropped~~ | ✅ FIXED | `artexplainer.Dockerfile:33` | Moved `[[tool.uv.index]]` insertion to before `[build-system]` anchor |
 | 2 | Runtime `.so` libs missing in production stage | 🔴 CRITICAL | `artexplainer.Dockerfile:131` | Install `libopenblas0`, `libgfortran5`, `libhdf5-103`, `libjpeg62-turbo` in prod stage |
 | 3 | Live `uv lock` at build time — non-reproducible | 🔴 HIGH | `artexplainer.Dockerfile:51,103` | Commit ppc64le lockfiles and use `--frozen` |
 | 4 | Main kserve pyproject.toml must not be modified | 🟠 HIGH | `python/kserve/pyproject.toml` | Confirm no committed change; sed-in-Dockerfile approach is correct |
